@@ -1,0 +1,387 @@
+.Dd Sep 4, 2017
+.Dt RSEB 8
+.Sh NAME
+.Nm rseb
+.Nd really simple Ethernet bridge
+.Sh SYNOPSIS
+.Nm
+.Op Fl d Ar n
+.Op Fl l Ar n
+.Op Fl p Ar probe-id
+.Op Fl R Ar n
+.Op Fl s Ar ip-addr
+.Op Fl t
+.Op Fl x
+.Op Fl X
+.I 
+.Sh DESCRIPTION
+.Nm
+is a Unix-style filter that gives simple text-level access to
+the Internet for mapping and host discovery.
+It generates several packet types, including ping, UDP, and TCP packet
+probes with varying TTLs, spoofed source addresses, source routing, and tunneling.
+.Pp
+.Ar packet-id
+.Sm off
+.Bq Ar tunnel-path : Bq I
+.Ar dest-path
+.Bq / Ar spoof-ip
+.Sm on
+.Ar packet-type
+.Pp
+.Bl -tag -width 11m
+.It Ar packet-id
+an integer used to match return packets with outgoing
+queries.  A value of -1 specifies a special control packet: see the source
+code for details.  Maximum values of
+.Ar packet-id
+vary with the query type.
+.It Ar tunnel-path , Ar dest-path
+May be a single numeric IP address, or a comma-separated list
+of loose source route addresses to the last IP address.
+.Ar tunnel-path
+leads to an optional tunnelling host using GRE encapsulation (protocol
+47)
+or
+IP-over-IP (protocol 4) if
+.Sy :I
+is used.
+.Ar dest-path
+may contain source routing path to the final destination after
+the packet emerges from the tunnel, if any.
+.It Ar spoof-ip
+Spoofed packet source address.  If not specified,
+outgoing packets will have a
+source address of the outgoing interface on multi-homed host.  Tunneled
+packets will have one of the host's interface addresses.
+.It Ar packet-type
+May optionally start with 
+.Sy F
+to set the IP more-fragments flags, followed by:
+.Bl -tag -width 11m
+.Sm off
+.It Xo Sy P Bo Ar ttl Bc Bo Sy R Bc Bo Sy T Bc
+.Xc
+.Sm on
+ICMP ping with optional 
+.Ar ttl .
+.Sy R
+sets IP record-route flag, 
+.Sy T
+set IP trace-route flag.
+Maximum
+.Ar packet-id
+is 32000.
+.Sm off
+.It Xo Sy T Bq Ar ttl
+.Bq Sy : Ar port
+.Bq Ar flags
+.Xc
+.Sm on
+SYN packet to TCP 
+.Ar port
+(default 80) with an optional 
+.Ar ttl .
+.Ar Flags
+may be any of
+.Sy A
+(set ACK bit),
+.Sy F
+(set FIN bit),
+.Sy P
+(set PUSH bit),
+.Sy R
+(set RST bit), and
+.Sy S
+(set SYN bit).
+Maximum
+.Ar packet-id
+is 29000.
+.It Ar ttl
+UDP packet to a port above 33422 (beginning of the
+.Xr traceroute 8
+range) with the given \fIttl\fP.
+Hosts usually do not run servers on this port range.
+Maximum
+.Ar packet-id
+is 29000.
+.Sm off
+.It Xo Sy X:port Bq Ar  ttl
+.Xc
+.Sm on
+Direct UDP packet to 
+.Sy port
+with the given \fIttl\fP.  Only available if
+.Fl X
+option is specified.
+Maximum
+.Ar packet-id
+is 10000.
+.Sm off
+.It Xo Sy S Bq Ar ttl
+.Xc
+.Sm on
+SNMP packet: see 
+.Sy SNMP Specification
+below.
+.Sm off
+.It Xo Sy D Bq Ar ttl
+.Sm on
+.Sm off
+.Sy N Ar name
+.Sm on
+.Sm off
+.Sy T Ar query-type
+.Sm on
+.Xc
+.Ar Query-type
+may be one of 
+.Sy A
+(address query),
+.Sy N
+(name server query), or
+.Sy PTR
+(PTR query).
+.Ar Name
+is the DNS query string corresponding to the 
+.Ar dns-query type .
+.Ar Name
+and
+.Ar query-type
+may appear in either order.
+.El
+.El
+.Pp
+.Ss SNMP Specification
+Since a SNMP packet has several options to set within it, the packet is
+specified at the end of input lines.  The format of the SNMP specification
+is:
+.ce 1
+\fB[\fP \fItype\~value\fP \fB[\fP \fItype\~value\fP \fB[\fP ... \fB] ] ]\fP
+Note that there is no space between the type (which is a one-letter
+description) and the value.  Only one OID can be specified per
+packet.  If a value is specified multiple times, only the last is
+used.  Any value not set is assumed to be 0 or the empty string, as
+appropriate.  If the PDU is not set, a PDU of 0 (invalid) is sent.
+.Pp
+The types of values are as follows:
+.Bl -tag -width indent
+.It C \fIstring\fP
+specifies the community string.  Currently, there is no way to
+specify a community string with a space in it.
+.It N \fIobjectID\fP
+specifies the odject ID of the query.  Internet (.1.3.6.1.2) is assumed
+by default.  To specify something else under org (.1.3), lead it with
+'43.'.  There is no way to specify anything more broad than that.
+.It R \fIinteger\fP
+specifies the version of SNMP to use (only v1 currently supported).
+.It V \fIinteger\fP
+specifies the value to give (only useful for Get Response, but is
+obeyed in all gets).
+.It P \fIchar\fP
+specifies the type of PDU to send.  Choices are:
+.Bl -tag -width ident
+.It R
+Get Request
+.It N
+Get Next Request
+.It S
+Get Response
+.It T
+Trap (unimplemented)
+.El
+.El
+.Pp
+.Ss Output lines
+Returning packets generate lines with three fields:  a integer packet identifier
+(corresponding to the outgoing packet,) an IP address,
+and a status field.  The
+.Fl x
+and
+.Fl t
+flags add information to the status field, which has one of the following:
+.br
+.Bl -tag -width Er
+.It Er died
+Packet's TTL exceeded before reaching the destination.  Address reported
+is the intermediate hop where the packet died.
+.It Er reached
+on most hosts, a packet just reaches the target host
+.It Er exceeded
+packet arrived at the target with excess TTL value
+.It Er pinged
+ping request reached a host
+.It Er pingme
+returned (or generated) an ICMP_ECHO, rather than the expected
+ICMP_ECHO_REPLY.  No idea why.
+.It Er Unreachable: reason
+ICMP unreachable.  
+\fIReason\fP
+may be host, network, filtered, 
+or several other much less common errors.
+.br
+.It Er OID = Value
+SNMP get response received.  A value of noSuchName means the value field had
+\fInull\fP type.
+.El
+.Pp
+Any other conditions show a full error message in the
+status field.
+.Pp
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl d Ar n
+minimum millisecond delay between transmitted packets.  This options is
+deprecated by the
+.Fl R
+option.
+.It Fl D
+increment debug level.
+.It Fl F
+append fingerprint output for each UDP->ICMP Unreach and PING packet.
+Not documented here.
+.It Fl H
+set handshake mode.  Not documented here.
+.It Fl i Ar interface
+Interface to monitor.  May be repeated to specify up to 32 interfaces.
+.It Fl l Ar n
+number of seconds to linger waiting for packets after EOF.
+.It Fl o Ar output-interface
+Specify the IP address of our raw output device.  If it contains a colon,
+packets are routed through a reflector (not documented here.)
+.It Fl p Ar probe-id
+Specify a probe ID that a remote receiver (a "mitt") can identify.
+.It Fl q
+Suppress announcement of output interface name to stderr on startup.
+.It Fl R Ar n
+maximum packet transmission rate.  Default is 50 packets per second.
+Very large values are 
+antisocial: they can can cause congestion and lost packets on the network
+or local computer.
+.It Fl s
+Default local spoof address.  Overridden by
+.Ar spoof-ip
+specified above.
+.It Fl S
+Stealth mode: use the IP_ID field instead of the UDP port to identify
+packets.
+.It Fl t
+append round trip time for each packet, rounded to milliseconds to each
+packet report.  This field
+is appended to the
+.Fl x
+option output, if selected.  If the round-trip time is more than 65,535
+milliseconds, this number may be inaccurate.
+This appears to work correctly for ping, but not other probes.
+.It Fl x
+show extended return information for each packet in a fourth, tab-delimited
+field. The field contains:
+.It Fl Z
+show packet I/O statistics at the end of the run.
+.Pp
+.Ar ttl-returned
+.Ar ttl-remote
+.Ar target-ip
+.Bq Ar round-trip-time
+.Pp
+.Bl -tag -width Er
+.It Ar ttl-returned
+The TTL of the responding packet.
+.It Ar ttl-remote
+The TTL of our test packet when it arrived at the remote host.
+.It Ar target-ip
+The IP address we sent the original packet to.
+the TTL of the returned packet, the TTL of the original packet when it arrived
+at its destination, and the target IP address.  The last two are extracted
+from the contents of the original packet, as returned from the responding host.
+.It Ar round-trip time
+See the
+.Fl t
+flag.
+.El
+.It Fl X
+Enable 
+.SY X:
+directed UDP queries.
+.El
+.Pp
+.Sh ENVIRONMENT VARIABLES
+.Bl -tag -width indent
+.It PROBE_ID
+An integer used to identify packets sent and received.  It must be between
+zero and 2^16-1.  If not specified, part of the process ID will be used.
+This is over-ridden by the
+.Fl p
+flag.
+.It NETIO_DEBUG
+Overrides the 
+.Fl d
+flag.
+.El
+.Pp
+.Sh EXAMPLES
+A simple shell script fragment that emulates 
+.Xr traceroute 8 :
+.ft CW
+.nf
+.ne 4
+	for i in `seq 1 50`
+	do
+		 echo "$i $host $i"
+	done | netio -l 2 | sort -n | uniq -1
+.ft R
+.fi
+.Pp
+This script probes a class C network for machines:
+.Pp
+.nf
+.ft CW
+.ne 8
+	for i in 1 2
+	do
+		for i in `seq 0 256`
+		do
+			echo $i $network.$i 30 
+		done
+	done  |  netio -l 2 |  egrep ' [Oo]k$'  |
+	awk '{print $2}'  |  sort +3n -t.  |  uniq
+.ft R
+.Pp
+Various queries and responses.  The responses are shown with tab
+separation for clarity.
+.Pp
+.ft CW
+.ne 8
+	seismo:~$ netio
+	srcport = 34767
+	netio: opening interface dc0
+	2	204.178.16.6	D Tp N6.16.178.204.in-addr.arpa
+	2	204.178.16.6	PTR      dirty.research.bell-labs.com
+	3	204.178.16.6	D Ta Nspiders.cheswick.com
+	3	204.178.16.6	SOA     ns.cheswick.com
+	4	204.178.16.6	D Ta Nrack.cheswick.com
+	4	204.178.16.6	IP      209.123.16.104
+	100	209.123.16.126	P
+	100	209.123.16.126	pinged
+.ft R
+.Pp
+.fi
+.Sh SEE ALSO
+.Xr traceroute 8
+.Sh BUGS
+This program does not contemplate IPv6.
+.Pp
+Existing syntax seems hard to extend very far.
+.Pp
+SNMP return packets aren't handled robustly.
+SNMP strings can't have spaces in them.
+Only SNMP v1 authentication is implemented receiving packets.
+Can only send one OID per SNMP packet. (Multiple OIDs ok in responses).
+SNMP errors are ignored, and should be handled better. 
+Received SNMP packets are always processed as if they were GET reponses.
+.Pp
+Separation is poor between extended information and SNMP return.
+.Pp
+DNS should probably have an ANY query type.
+.Pp
+A plague of options.
