@@ -169,6 +169,42 @@ crack_ip(const char *buf, sockunion *su, int numeric) {
 	return 0;
 }
 
+
+char *
+getcaller(int s) {
+	socklen_t len;
+	struct sockaddr_storage addr;
+	static char ipstr[INET6_ADDRSTRLEN];
+	int port = 0;
+	int rc;
+	
+	len = sizeof addr;
+	if (getpeername(s, (struct sockaddr*)&addr, &len) < 0) {
+		switch (errno) {
+		case ENOTSOCK:
+			return "(Not a socket)";
+		default:
+			return strerror(errno);
+		}
+	}
+	
+	if (addr.ss_family == AF_INET) {
+		struct sockaddr_in *s = (struct sockaddr_in *)&addr;
+		port = ntohs(s->sin_port);
+		inet_ntop(AF_INET, &s->sin_addr, ipstr, sizeof ipstr);
+	} else if (addr.ss_family == AF_INET6) {
+		struct sockaddr_in6 *s = (struct sockaddr_in6 *)&addr;
+		port = ntohs(s->sin6_port);
+		inet_ntop(AF_INET6, &s->sin6_addr, ipstr, sizeof ipstr);
+	} else {
+		snprintf(ipstr, sizeof(ipstr), "(unknown address family %d)",
+			addr.ss_family);
+	}
+	if (debug)
+		fprintf(stderr, "remote: %s: %d\n", ipstr, port);
+	return ipstr;
+}
+
 void
 interrupt(int i) {
 	if (debug)
@@ -213,6 +249,10 @@ main(int argc, char *argv[]) {
 		break;
 	case 3:			// client, target host and port
 		service_port = atoi(argv[2]);
+		if (service_port < 1 || service_port > IPPORT_MAX) {
+			fprintf(stderr, "rseb: bad port number: %s\n", argv[2]);
+			return 2;
+		}
 		// FALLTHROUGH
 	case 2:			// client, target host, default port
 		err = crack_ip(argv[1], &tunnel_sockaddr, 0);
@@ -223,6 +263,10 @@ main(int argc, char *argv[]) {
 	}
 	interface_name = argv[0];
 
+	if (err) {
+		fprintf(stderr, "rseb: %s: %s", argv[1], err);
+		return 3;
+	}
 //	signal(SIGINT, interrupt);
 //	signal(SIGHUP, interrupt);
 
@@ -230,7 +274,7 @@ main(int argc, char *argv[]) {
 		// because we need access to raw packets on a given interface,
 		// both receiving and sending
 		fprintf(stderr, "reb: must be run as root\n");
-		exit(2);
+		return 4;
 	}
 
 	if (strcmp(interface_name, "-") == 0) {
@@ -244,6 +288,7 @@ main(int argc, char *argv[]) {
 		dev = interface_name;
 
 	if (debug) {
+		char buf[INET6_ADDRSTRLEN];
 		if (is_server) {
 			fprintf(stderr, "rseb server, interface %s\n",
 				dev);
@@ -254,5 +299,50 @@ main(int argc, char *argv[]) {
 		}
 	}
 
+	// set up tunnel file descriptor
+
+	if (is_server) {	// inetd does the work here
+		lfd = 0; // stdin, from inetd
+		if (debug)
+			fprintf(stderr, "remote is %s\n", getcaller(0));
+	} else {		// we open a UDP link to our remote selves
+		int on = 1;
+		struct sockaddr tunaddr;
+
+		memset(&tunaddr, 0, sizeof(tunaddr));
+		switch (tunnel_sockaddr.sa.sa_family) {
+			case AF_INET: {
+				struct sockaddr_in *sin = (struct sockaddr_in *)&tunaddr;
+				sin->sin_family = tunnel_sockaddr.sa.sa_family;
+				sin->sin_port = 0;	// any source port in a storm
+				sin->sin_addr.s_addr = INADDR_ANY;
+				break;
+			}
+			case AF_INET6: {
+				struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&tunaddr;
+				sin6->sin6_family = tunnel_sockaddr.sa.sa_family;
+				sin6->sin6_port = 0;	// any source port in a storm
+				sin6->sin6_flowinfo = 0;	// why?
+				sin6->sin6_addr = in6addr_any;
+				break;
+			}
+		}
+
+		rfd = socket(tunnel_sockaddr.sa.sa_family, SOCK_DGRAM, 0);
+		if (rfd < 0) {
+			perror("rseb: udp socket");
+			return 11;
+		}
+
+		if (setsockopt(rfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
+			perror("rseb: tunnel setsockopt");
+			return 12;
+		}
+
+		if (bind(rfd, &tunaddr, sizeof(tunaddr))) {
+			perror("rseb: udp bind");
+			return 12;
+		}
+	}
 	return 0;
 }
