@@ -43,8 +43,8 @@
 
 int service_port = RSEB_PORT;
 int debug = 0;
-int rfd = -1;		// remote tunnel connection
-int lfd = -1;		// our local tap/sniff/raw socket
+int tfd = -1;		// tunnel connection
+pcap_t *pcap_handle;
 
 
 /*
@@ -229,6 +229,8 @@ main(int argc, char *argv[]) {
 	char *err = 0;
 	char pcap_err_buf[PCAP_ERRBUF_SIZE];
 	char *dev;
+	struct bpf_program fp;
+#define PCAP_FILTER	"arp"
 
 	SPLAY_INIT(&local_ethernets);
 
@@ -302,7 +304,7 @@ main(int argc, char *argv[]) {
 	// set up tunnel file descriptor
 
 	if (is_server) {	// inetd does the work here
-		lfd = 0; // stdin, from inetd
+		tfd = 0; // stdin, from inetd
 		if (debug)
 			fprintf(stderr, "remote is %s\n", getcaller(0));
 	} else {		// we open a UDP link to our remote selves
@@ -314,35 +316,62 @@ main(int argc, char *argv[]) {
 			case AF_INET: {
 				struct sockaddr_in *sin = (struct sockaddr_in *)&tunaddr;
 				sin->sin_family = tunnel_sockaddr.sa.sa_family;
-				sin->sin_port = 0;	// any source port in a storm
+				sin->sin_port = RSEB_PORT;	// any source port in a storm
 				sin->sin_addr.s_addr = INADDR_ANY;
 				break;
 			}
 			case AF_INET6: {
 				struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&tunaddr;
 				sin6->sin6_family = tunnel_sockaddr.sa.sa_family;
-				sin6->sin6_port = 0;	// any source port in a storm
+				sin6->sin6_port = RSEB_PORT;	// any source port in a storm
 				sin6->sin6_flowinfo = 0;	// why?
 				sin6->sin6_addr = in6addr_any;
 				break;
 			}
 		}
 
-		rfd = socket(tunnel_sockaddr.sa.sa_family, SOCK_DGRAM, 0);
-		if (rfd < 0) {
+		tfd = socket(tunnel_sockaddr.sa.sa_family, SOCK_DGRAM, 0);
+		if (tfd < 0) {
 			perror("rseb: udp socket");
 			return 11;
 		}
 
-		if (setsockopt(rfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
+		if (setsockopt(tfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
 			perror("rseb: tunnel setsockopt");
 			return 12;
 		}
 
-		if (bind(rfd, &tunaddr, sizeof(tunaddr))) {
+#ifdef notneeded
+		if (bind(tfd, &tunaddr, sizeof(tunaddr))) {
 			perror("rseb: udp bind");
 			return 12;
 		}
+#endif
 	}
+
+	// now initialize our pcap connection to the given interface
+
+	pcap_handle = pcap_open_live(dev, BUFSIZ, 1, 1, pcap_err_buf);
+	if (pcap_handle == NULL) {
+		fprintf(stderr, "rseb: could not open interface '%s': %s\n",
+			dev, pcap_err_buf);
+		return 15;
+	}
+	if (pcap_datalink(pcap_handle) != DLT_EN10MB) {
+		fprintf(stderr, "rseb: interface '%s' not supported\n", dev);
+		return 16;
+	}
+
+	if (pcap_compile(pcap_handle, &fp, PCAP_FILTER, 0, 0) < 0) {
+		fprintf(stderr, "rseb: bad filter: '%s', %s\n", 
+			PCAP_FILTER, pcap_geterr(pcap_handle));
+		return 17;
+	}
+	if (pcap_setfilter(pcap_handle, &fp) < 0) {
+		fprintf(stderr, "rseb: could not install filter: '%s', %s\n", 
+			PCAP_FILTER, pcap_geterr(pcap_handle));
+		return 18;
+	}
+
 	return 0;
 }
