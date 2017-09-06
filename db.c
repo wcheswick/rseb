@@ -10,6 +10,7 @@
 
 #include "rseb.h"
 
+int db_debug = 0;	// internal database debugging
 
 typedef struct ethernet_entry {
 	SPLAY_ENTRY(ethernet_entry) next;
@@ -43,7 +44,8 @@ add_entry(u_char new[ETHER_ADDR_LEN]) {
 		e->last_seen = now();
 		return;
 	}
-	Log(LOG_DEBUG, "new local: %s", ether_addr(new));
+	if (db_debug)
+		Log(LOG_DEBUG, "new local: %s", ether_addr(new));
 
 	e = (struct ethernet_entry *)malloc(sizeof(struct ethernet_entry));
 	assert(e);
@@ -77,6 +79,9 @@ dump_db(void) {
 	time_t t = now();
 	struct ethernet_entry *e;
 
+	if (!db_debug)
+		return;
+	
 	SPLAY_FOREACH(e, ethernet_tree, &local_ethernets) {
 		Log(LOG_DEBUG, "%s %7d  %5d",
 			ether_addr(e->addr), e->count, t - e->last_seen);

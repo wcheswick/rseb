@@ -8,6 +8,8 @@ typedef enum packet_proto {
 	Pbye,
 } packet_proto;
 
+#define PROTO_SIZE	sizeof(int)
+
 typedef struct packet {
 	ssize_t len;
 	const u_char *data;

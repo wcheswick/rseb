@@ -34,9 +34,8 @@
 #include "rseb.h"
 #include "arg.h"
 
-#define RSEB_PORT	1127
+#define RSEB_PORT	"1127"
 
-int service_port = RSEB_PORT;
 int debug = 0;
 int tfd = -1;		// tunnel connection
 int pcap_fd = -1;
@@ -47,64 +46,7 @@ char pcap_err_buf[PCAP_ERRBUF_SIZE];
 
 #define PCAP_FILTER	"arp"
 
-/*
- * I am actually understanding this sockaddr casting crap, finally.  Pascal
- * did this much more cleanly, and safely.
- */
 
-typedef union   sockunion {
-        struct  sockaddr sa;
-        struct  sockaddr_in sin;
-        struct  sockaddr_in6 sin6;
-        struct  sockaddr_storage ss; /* added to avoid memory overrun */
-} sockunion;
-
-sockunion tunnel_sockaddr;
-
-
-char *
-sutop(sockunion *su) {
-	static char buf[500];
-
-	switch (su->sa.sa_family) {
-	case PF_INET:
-		inet_ntop(PF_INET, &su->sin.sin_addr, buf, sizeof(buf));
-		break;
-	case PF_INET6:
-		inet_ntop(PF_INET6, &su->sin6.sin6_addr, buf, sizeof(buf));
-		break;
-	default:
-		Log(LOG_ERR, "sutop, inconceivable family: %d\n",
-			su->sa.sa_family);
-		abort();
-	}
-	return buf;
-}
-
-/*
- * return a string containing the numeric address in the addrinfo
- */
-char *
-ai_ntos(struct addrinfo *ai) {
-	static char buf[NI_MAXHOST];
-
-	getnameinfo(ai->ai_addr, ai->ai_addrlen, buf, sizeof(buf), 0, 0,
-		NI_NUMERICHOST);
-	return buf;
-}
-
-void
-dump_ai(struct addrinfo *ai) {
-	Log(LOG_DEBUG, "dump_ai	flags=  0x%.08x\n", ai->ai_flags);
-	Log(LOG_DEBUG, "	family= %d\n", ai->ai_family);
-	Log(LOG_DEBUG, "	socktyp=%d\n", ai->ai_socktype);
-	Log(LOG_DEBUG, "	proto=  %d\n", ai->ai_protocol);
-	Log(LOG_DEBUG, "	addrlen=%d\n", ai->ai_addrlen);
-	Log(LOG_DEBUG, "	canonnm=%s\n", ai->ai_canonname);
-	Log(LOG_DEBUG, "	value=  %s\n", ai_ntos(ai));
-	if (ai->ai_next)
-		dump_ai(ai->ai_next);
-}
 
 // return an fd for the pcap device if all is ok
 
@@ -150,96 +92,56 @@ init_pcap(char *dev) {
 }
 
 int
-udp_tunnel_socket(sockunion *sa, int port) {
-	int on = 1;
-	struct sockaddr tunaddr;
-	int s;
-
-	memset(&tunaddr, 0, sizeof(tunaddr));
-	switch (sa->sa.sa_family) {
-		case AF_INET: {
-			struct sockaddr_in *sin = (struct sockaddr_in *)&tunaddr;
-			sin->sin_family = sa->sa.sa_family;
-			sin->sin_port = htons(port);	// any source port in a storm
-			sin->sin_addr.s_addr = INADDR_ANY;
-			break;
-		}
-		case AF_INET6: {
-			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&tunaddr;
-			sin6->sin6_family = sa->sa.sa_family;
-			sin6->sin6_port = htons(port);	// any source port in a storm
-			sin6->sin6_flowinfo = 0;	// why?
-			sin6->sin6_addr = in6addr_any;
-			break;
-		}
-	}
-
-	s = socket(sa->sa.sa_family, SOCK_DGRAM, 0);
-	if (s < 0) {
-		perror("rseb: udp socket");
-		return -1;
-	}
-
-	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
-		perror("rseb: tunnel setsockopt");
-		return -1;
-	}
-
-	return s;
-}
-
-/*
- * The first parameter is a string containing an IP address.  Crack it and
- * put the results in su.  Return a non-null error string if there is a problem.
- */
-char *
-crack_ip(const char *buf, sockunion *su, int numeric) {
-	struct addrinfo hints, *res;
-	static char errbuf[200];
+create_udp_tunnel_socket(char *host_name, char *port) {
+//	int on = 1;
+	int s = -1;;
+	struct addrinfo hints, *res, *res0;
 	int error;
-
-	Log(LOG_DEBUG, "crack_ip of %s", buf);
-
-	if (buf == 0)
-		return "missing: empty string";
+	const char *cause = NULL;
 
 	memset(&hints, 0, sizeof(hints));
-	if (strchr(buf, ':') != 0)
-		hints.ai_family = AF_INET6;
-	else
-		hints.ai_family = AF_INET;
-	if (numeric)
-		hints.ai_flags = AI_NUMERICHOST;
+	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM;
-	error = getaddrinfo(buf, 0, &hints, &res);
+	error = getaddrinfo(host_name, port, &hints, &res0);
 	if (error) {
-		snprintf(errbuf, sizeof(errbuf), "bad address: %s, %s\n",
-			buf, gai_strerror(error));
-		return errbuf;
+        	Log(LOG_ERR, "getaddress failure:%s", gai_strerror(error));
+                return -1;
 	}
-	if (res->ai_next) {
-		Log(LOG_ERR, "crack_ip: too many answers for address %s, ignoring extras:", buf);
-		dump_ai(res);
+
+	for (res = res0; res; res = res->ai_next) {
+		s = socket(res->ai_family, res->ai_socktype,
+		res->ai_protocol);
+		if (s < 0) {
+			cause = "socket";
+			continue;
+		}
+#ifdef XXXXX
+		if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
+			perror("rseb: tunnel setsockopt");
+			return -1;
+		}
+#endif
+		if (connect(s, res->ai_addr, res->ai_addrlen) < 0) {
+			cause = "connect";
+			close(s);
+			s = -1;
+			continue;
+		}
+
+		break;  /* okay we got one */
 	}
-	su->sa.sa_family = res->ai_family;
-	switch (su->sa.sa_family) {
-	case AF_INET:
-		su->sin = *((struct sockaddr_in *)res->ai_addr);
-		break;
-	case AF_INET6:
-		su->sin6 = *((struct sockaddr_in6 *)res->ai_addr);
-		break;
-	default:
-		abort();
+	if (s < 0) {
+		Log(LOG_ERR, "tunnel failed: %s", cause);
+		return -1;
 	}
-	freeaddrinfo(res);
-	return 0;
+	freeaddrinfo(res0);
+	return s;
 }
 
 // returns NULL if fd is not a socket
 
 char *
-getcaller(int s) {
+get_remote_name(int s) {
 	socklen_t len;
 	struct sockaddr_storage addr;
 	static char ipstr[INET6_ADDRSTRLEN];
@@ -267,7 +169,6 @@ getcaller(int s) {
 		snprintf(ipstr, sizeof(ipstr), "(unknown address family %d)",
 			addr.ss_family);
 	}
-	Log(LOG_DEBUG, "remote: %s: %d", ipstr, port);
 	return ipstr;
 }
 
@@ -310,8 +211,7 @@ get_remote_packet(void) {
 
 void
 send_packet_to_remote(packet *pkt) {
-	socklen_t to_len = sizeof(tunnel_sockaddr);
-	ssize_t n = sendto(tfd, pkt->data, pkt->len, 0, &tunnel_sockaddr, to_len);
+	ssize_t n = send(tfd, pkt->data, pkt->len, MSG_EOR);
 	if (n < 0) {
 		Log(LOG_WARNING, "packet transmit error %s", strerror(errno));
 		return;
@@ -319,13 +219,21 @@ send_packet_to_remote(packet *pkt) {
 	if (n != pkt->len)
 		Log(LOG_WARNING, "send_packet_to_remote: short packet: %d %d",
 			n, pkt->len);
-	Log(LOG_DEBUG, "sending %d bytes", pkt->len);
+	Log(LOG_DEBUG, "sent %d bytes to %s", pkt->len, get_remote_name(tfd));
+}
+
+void
+send_proto(int proto_msg) {
+	packet p;
+	p.data = (void *)&proto_msg;
+	p.len = sizeof(proto_msg);
+	send_packet_to_remote(&p);
 }
 
 void
 interrupt(int i) {
 	Log(LOG_DEBUG, "interrupt %d, terminating", i);
-//	finish();
+	send_proto(Pbye);
 }
 
 int
@@ -337,8 +245,10 @@ usage(void) {
 int
 main(int argc, char *argv[]) {
 	int is_server;
-	char *err = 0;
 	char *dev = 0;
+	char *port = RSEB_PORT;
+	char *remote_host = 0;
+	char *remote_end;
 
 	init_db();
 
@@ -366,7 +276,6 @@ main(int argc, char *argv[]) {
 				pcap_err_buf);
 			return 10;
 		}
-		Log(LOG_INFO, "Bridging local interface %s", dev);
 	}
 
 	switch (argc) {
@@ -374,22 +283,14 @@ main(int argc, char *argv[]) {
 		is_server = 1;
 		break;
 	case 2:			// client, target host and port
-		service_port = atoi(argv[1]);
-		if (service_port < 1 || service_port > IPPORT_MAX) {
-			Log(LOG_ERR, "bad port number: %s", argv[2]);
-			return 2;
-		}
+		port = argv[1];
 		// FALLTHROUGH
 	case 1:			// client, target host, default port
-		err = crack_ip(argv[0], &tunnel_sockaddr, 0);
+		remote_host = argv[0];
 		is_server = 0;
 		break;
 	default:
 		return usage();
-	}
-	if (err) {
-		Log(LOG_ERR, "%s: %s", argv[0], err);
-		return 3;
 	}
 
 	if (getuid() != 0) {
@@ -400,26 +301,17 @@ main(int argc, char *argv[]) {
 		return 4;
 	}
 
-	if (is_server) {
-		Log(LOG_DEBUG, "rseb server, interface %s", dev);
-	} else {
-		Log(LOG_DEBUG, "rseb client, interface %s, remote %s %d",
-			dev, sutop(&tunnel_sockaddr), service_port);
-	}
-
 	// set up tunnel file descriptor
 
 	if (is_server) {	// inetd does the work here
-		char *remote_ip = getcaller(0);
+		char *remote_ip = get_remote_name(0);
 		if (remote_ip) {
-			tfd = 0; // stdin, from inetd
-			Log(LOG_DEBUG, "remote is %s", remote_ip);
+			tfd = 1; // stdout, from inetd
 		} else {
 			Log(LOG_ERR, "no tunnel connection");
-// XXXXX			return 10;
 		}
 	} else {		// we open a UDP link to our remote selves
-		tfd = udp_tunnel_socket(&tunnel_sockaddr, RSEB_PORT);
+		tfd = create_udp_tunnel_socket(remote_host, port);
 		if (tfd < 0)
 			return 11;
 	}
@@ -428,10 +320,18 @@ main(int argc, char *argv[]) {
 	if (pcap_fd < 0)
 		return 12;
 
-//	signal(SIGINT, interrupt);
-//	signal(SIGHUP, interrupt);
+	signal(SIGINT, interrupt);
+	signal(SIGHUP, interrupt);
 
-	Log(LOG_DEBUG, "Running....");
+	remote_end = get_remote_name(tfd);
+	Log(LOG_INFO, "Bridging interface %s to %s", dev, remote_end);
+
+	if (!is_server) {
+		send_proto(Phello);
+	} else {
+Log(LOG_INFO, "server, fd 0 is %s", get_remote_name(0));
+Log(LOG_INFO, "server, fd 1 is %s", get_remote_name(1));
+	}
 
 	while (1) {
 		int n, busy = 0;
@@ -467,6 +367,24 @@ main(int argc, char *argv[]) {
 			pkt = get_remote_packet();
 			if (!pkt)
 				continue;
+			if (pkt->len == PROTO_SIZE) {
+				int proto = *(int *)pkt->data;
+				switch (proto) {
+				case Phello:
+					Log(LOG_INFO, "Session started at other end");
+					send_proto(Phelloback);
+					break;
+				case Phelloback:
+					Log(LOG_INFO, "Remote end is alive");
+					break;
+				case Pbye:
+					Log(LOG_INFO, "Session terminated by other end");
+					return 0;
+				default:
+					Log(LOG_WARNING, "Unexpected protocol: %d", proto);
+				}
+			} else
+				Log(LOG_DEBUG, "packet received, length %d", pkt->len);
 			busy = 1;
 		}
 		if (!busy) {
@@ -476,5 +394,6 @@ dump_db();
 		}
 	}
 
+	send_proto(Pbye);	// currently not executed
 	return 0;
 }
