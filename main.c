@@ -18,7 +18,6 @@
 #include <netinet/ip6.h>
 #include <arpa/inet.h>
 #include <sys/un.h>
-#include <syslog.h>
 #include <stdarg.h>
 #include <sys/select.h>
 #include <pcap.h>
@@ -26,22 +25,15 @@
 
 #ifdef __FreeBSD__
 #include <sys/sockio.h>
+#include <sys/limits.h>
 #else
 #include <linux/sockios.h>
 #endif
 
 
-//#if __FreeBSD_version >= 500000
-#include <sys/limits.h>
-#include <sys/tree.h>           // for the splay routines
-//#else
-//#include <machine/limits.h>
-//#include "tree.h"               // for the splay routines
-//#endif
-
+#include "rseb.h"
 #include "arg.h"
 
-#define ETHERNET_ADDR_SIZE	6
 #define RSEB_PORT	1127
 
 int service_port = RSEB_PORT;
@@ -53,6 +45,7 @@ int use_syslog = 1;
 pcap_t *pcap_handle;
 char pcap_err_buf[PCAP_ERRBUF_SIZE];
 
+#define PCAP_FILTER	"arp"
 
 /*
  * I am actually understanding this sockaddr casting crap, finally.  Pascal
@@ -66,45 +59,8 @@ typedef union   sockunion {
         struct  sockaddr_storage ss; /* added to avoid memory overrun */
 } sockunion;
 
-typedef struct ethernet {
-	SPLAY_ENTRY(ethernet) next;
-	u_char addr[ETHERNET_ADDR_SIZE];
-	int incoming, outgoing;
-} ethernet;
+sockunion tunnel_sockaddr;
 
-SPLAY_HEAD(ethernet_tree, ethernet) local_ethernets;
-
-int
-ethernet_compare(ethernet *a, ethernet *b) {
-	return memcmp((ethernet *)a->addr, (ethernet *)b->addr, ETHERNET_ADDR_SIZE);
-}
-
-SPLAY_PROTOTYPE(ethernet_tree, ethernet, next, ethernet_compare);
-SPLAY_GENERATE(ethernet_tree, ethernet, next, ethernet_compare);
-
-
-void
-Log(int level, char *msg, ...) {
-	va_list args;
-
-	if (level == LOG_DEBUG && !debug)
-		return;
-
-	if (use_syslog) {
-		va_start(args, msg);
-		vsyslog(level, msg, args);
-		va_end(args);
-	} else {
-		char buf[1000];
-		va_start(args, msg);
-		vsnprintf(buf, sizeof(buf), msg, args);
-		va_end(args);
-		if (strchr(buf, '\n'))
-			fprintf(stderr, "rseb: %s", buf);
-		else
-			fprintf(stderr, "rseb: %s\n", buf);
-	}
-}
 
 char *
 sutop(sockunion *su) {
@@ -149,8 +105,6 @@ dump_ai(struct addrinfo *ai) {
 	if (ai->ai_next)
 		dump_ai(ai->ai_next);
 }
-
-#define PCAP_FILTER	"arp"
 
 // return an fd for the pcap device if all is ok
 
@@ -290,7 +244,6 @@ getcaller(int s) {
 	struct sockaddr_storage addr;
 	static char ipstr[INET6_ADDRSTRLEN];
 	int port = 0;
-	int rc;
 	
 	len = sizeof addr;
 	if (getpeername(s, (struct sockaddr*)&addr, &len) < 0) {
@@ -318,30 +271,55 @@ getcaller(int s) {
 	return ipstr;
 }
 
-void
-process_local_packet(void) {
+packet *
+get_local_packet(void) {
 	struct pcap_pkthdr *phdr;
-	const u_char *pkt;
+	static packet p;
 	struct ether_header *ehdr;
-	int rc = pcap_next_ex(pcap_handle, &phdr, &pkt);
+	int rc = pcap_next_ex(pcap_handle, &phdr, &p.data);
 	switch (rc) {
 	case 0:		// timeout
 		Log(LOG_DEBUG, "pcap timeout");
-		return;
+		return 0;
 	case 1:		// have a packet
 		break;
 	default:	// some error
 		Log(LOG_WARNING, "pcap_next_ex error: %s", pcap_geterr(pcap_handle));
-		return;
+		return 0;
 	}
 
-	ehdr = (struct ether_header *)pkt;
-	
-	Log(LOG_DEBUG, "local packet len %d type 0x%.04x", phdr->len, ntohs(ehdr->ether_type));
+	ehdr = (struct ether_header *)p.data;
+	Log(LOG_DEBUG, "  local: %s", edump(ehdr));
+	if (phdr->caplen != phdr->len) {
+		Log(LOG_WARNING, "short packet, %d != %d", phdr->caplen != phdr->len);
+	}
+	p.len = phdr->caplen;
+	return &p;
+}
+
+packet *
+get_remote_packet(void) {
+	static u_char buf[1500];
+	struct sockaddr sa;
+	socklen_t sa_len = sizeof(sa);
+	static packet p;
+	p.len = recvfrom(tfd, buf, sizeof(buf), 0, &sa, &sa_len);
+	p.data = (const u_char *)&buf;
+	return &p;
 }
 
 void
-process_remote_packet(void) {
+send_packet_to_remote(packet *pkt) {
+	socklen_t to_len = sizeof(tunnel_sockaddr);
+	ssize_t n = sendto(tfd, pkt->data, pkt->len, 0, &tunnel_sockaddr, to_len);
+	if (n < 0) {
+		Log(LOG_WARNING, "packet transmit error %s", strerror(errno));
+		return;
+	}
+	if (n != pkt->len)
+		Log(LOG_WARNING, "send_packet_to_remote: short packet: %d %d",
+			n, pkt->len);
+	Log(LOG_DEBUG, "sending %d bytes", pkt->len);
 }
 
 void
@@ -352,24 +330,24 @@ interrupt(int i) {
 
 int
 usage(void) {
-	Log(LOG_ERR, "usage: rseb [-d] [-s] {interface|-} [remote ip [remote port]]");
+	Log(LOG_ERR, "usage: rseb [-d [-d]] [-s] [-i interface] [remote ip [remote port]]");
 	return 1;
 }
 
 int
 main(int argc, char *argv[]) {
 	int is_server;
-	char *tunnel_addr = 0;
-	char *interface_name;
 	char *err = 0;
-	char *dev;
-	sockunion tunnel_sockaddr;
+	char *dev = 0;
 
-	SPLAY_INIT(&local_ethernets);
+	init_db();
 
 	ARGBEGIN {
 	case 'd':
 		debug++;
+		break;
+	case 'i':
+		dev = ARGF();
 		break;
 	case 's':
 		use_syslog = 0;		// stderr instead
@@ -378,30 +356,39 @@ main(int argc, char *argv[]) {
 		return usage();
 	} ARGEND;
 
-	if (argc < 1)	// need an interface name
-		return usage();
+	if (use_syslog)
+		openlog("rseb", LOG_CONS, LOG_DAEMON);
+
+	if (!dev) {
+		dev = pcap_lookupdev(pcap_err_buf);
+		if (dev == NULL) {
+			Log(LOG_ERR, "pcap cannot find default device: %s",
+				pcap_err_buf);
+			return 10;
+		}
+		Log(LOG_INFO, "Bridging local interface %s", dev);
+	}
 
 	switch (argc) {
-	case 1:
+	case 0:
 		is_server = 1;
 		break;
-	case 3:			// client, target host and port
-		service_port = atoi(argv[2]);
+	case 2:			// client, target host and port
+		service_port = atoi(argv[1]);
 		if (service_port < 1 || service_port > IPPORT_MAX) {
 			Log(LOG_ERR, "bad port number: %s", argv[2]);
 			return 2;
 		}
 		// FALLTHROUGH
-	case 2:			// client, target host, default port
-		err = crack_ip(argv[1], &tunnel_sockaddr, 0);
+	case 1:			// client, target host, default port
+		err = crack_ip(argv[0], &tunnel_sockaddr, 0);
 		is_server = 0;
 		break;
 	default:
 		return usage();
 	}
-
 	if (err) {
-		Log(LOG_ERR, "%s: %s", argv[1], err);
+		Log(LOG_ERR, "%s: %s", argv[0], err);
 		return 3;
 	}
 
@@ -412,17 +399,6 @@ main(int argc, char *argv[]) {
 		Log(LOG_ERR, "must be run as root");
 		return 4;
 	}
-
-	interface_name = argv[0];
-	if (strcmp(interface_name, "-") == 0) {
-		dev = pcap_lookupdev(pcap_err_buf);
-		if (dev == NULL) {
-			Log(LOG_ERR, "pcap cannot find default device: %s",
-				pcap_err_buf);
-			return 10;
-		}
-	} else
-		dev = interface_name;
 
 	if (is_server) {
 		Log(LOG_DEBUG, "rseb server, interface %s", dev);
@@ -439,7 +415,7 @@ main(int argc, char *argv[]) {
 			tfd = 0; // stdin, from inetd
 			Log(LOG_DEBUG, "remote is %s", remote_ip);
 		} else {
-			Log(LOG_ERR, "no tunnel connection, quitting");
+			Log(LOG_ERR, "no tunnel connection");
 // XXXXX			return 10;
 		}
 	} else {		// we open a UDP link to our remote selves
@@ -461,10 +437,11 @@ main(int argc, char *argv[]) {
 		int n, busy = 0;
 		fd_set fds;
 		struct timeval timeout;
+		packet *pkt;
 
 		FD_ZERO(&fds);
 		FD_SET(pcap_fd, &fds);
-//XXXXX		FD_SET(tfd, &fds);
+		FD_SET(tfd, &fds);
 
 		timeout.tv_sec = 10;	// seconds CHECKTIME;
 		timeout.tv_usec = 0;
@@ -476,14 +453,27 @@ main(int argc, char *argv[]) {
 		}
 
 		if (FD_ISSET(pcap_fd, &fds)) {		// incoming local packet
-			process_local_packet();
-//XXXXX		} else if (FD_ISSET(tfd, &fds)) { 	// something from the tunnel
-			process_remote_packet();
-//XXXXX			Log(LOG_DEBUG, "tunnel packet");
-		} else {	// nothing.  timeout?
-			Log(LOG_DEBUG, "timeout");
+			pkt = get_local_packet();
+			if (!pkt)
+				continue;
+			add_entry(ETHER(pkt)->ether_shost);
+			if (IS_EBCAST(ETHER(pkt)->ether_dhost) ||
+			    !known_entry(ETHER(pkt)->ether_dhost)) {
+				send_packet_to_remote(pkt);
+			}
+			busy = 1;
 		}
-return 13;
+		if (FD_ISSET(tfd, &fds)) { 	// something from the tunnel
+			pkt = get_remote_packet();
+			if (!pkt)
+				continue;
+			busy = 1;
+		}
+		if (!busy) {
+			Log(LOG_DEBUG, "timeout");
+dump_db();
+			usleep(500);	// microseconds
+		}
 	}
 
 	return 0;
