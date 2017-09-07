@@ -92,78 +92,98 @@ init_pcap(char *dev) {
 	return fd;
 }
 
-int
-create_udp_tunnel_listener(int port) {
-	int on = 1;
-	int s;
-	struct sockaddr_in nsaddr;
 
-	s = socket(AF_INET, SOCK_DGRAM, 0);
-	if (s < 0) {
-		Log(LOG_ERR, "listener failed: %s", strerror(errno));
-		return -1;
-	}
-	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
-	    (char *)&on, sizeof(on)) != 0) {
-		Log(LOG_ERR, "listener setsockopt failed: %s", strerror(errno));
-		return -1;
-	}
+// Construct a sockaddr for either inet or inet6.  if use_ai is true, use the host
+// information from addrinfo, else the appropriate version of INADDR_ANY.
 
-	memset(&nsaddr, 1, sizeof(nsaddr));
-	nsaddr.sin_family = AF_INET;		// XXX AF_INET ok?
-	nsaddr.sin_addr.s_addr = INADDR_ANY;
-	nsaddr.sin_port = htons(port);
-	if (bind(s, (struct sockaddr *)&nsaddr, sizeof(nsaddr))) {
-		Log(LOG_ERR, "listener bind failed: %s", strerror(errno));
-		return -1;
+struct sockaddr *
+make_sa(struct addrinfo *res, int use_ai, socklen_t *sa_length) {
+	struct sockaddr *sa;
+
+	*sa_length = res->ai_addrlen;
+	sa = (struct sockaddr *)malloc(*sa_length);
+	memcpy(sa, res->ai_addr, *sa_length);
+
+	// set local listening address if not use_ai
+
+	switch (sa->sa_family) {
+		case AF_INET: {
+			struct sockaddr_in *sa4 = (struct sockaddr_in *)sa;
+			sa4->sin_addr.s_addr = INADDR_ANY;
+//			sa4->sin_port = htons(port);
+			break;
+		}
+		case AF_INET6: {
+			struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)sa;
+			sa6->sin6_addr = in6addr_any;
+//			sa6->sin6_port = htons(port);
+			break;
+		}
 	}
-	return s;
+	Log(LOG_DEBUG, "make_sa: %s", sa_str(sa));
+	return sa;
 }
 
+// For the client, this information is derived from the supplied host name/port
+// For the server, it is extracted from the incoming connection information
+// in the first packet received.
+
+struct sockaddr *remote_tunnel_sa;
+socklen_t remote_tunnel_sa_size;
+
+struct addrinfo *tunnel_res;
+
+
 int
-create_udp_tunnel_socket(char *host_name, char *port) {
-//	int on = 1;
-	int s = -1;;
-	struct addrinfo hints, *res, *res0;
+create_udp_tunnel_to_server(char *host_name, char *port_name) {
+	int on = 1;
+	int s = -1;
+	static struct addrinfo hints,  *tunnel_ai;
 	int error;
-	const char *cause = NULL;
+	struct addrinfo *tunnel_local_ai;
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM;
-	error = getaddrinfo(host_name, port, &hints, &res0);
+	hints.ai_protocol = IPPROTO_UDP;
+	error = getaddrinfo(host_name, port_name, &hints, &tunnel_ai);
 	if (error) {
         	Log(LOG_ERR, "getaddress failure:%s", gai_strerror(error));
                 return -1;
 	}
 
-	for (res = res0; res; res = res->ai_next) {
-		s = socket(res->ai_family, res->ai_socktype,
-		res->ai_protocol);
-		if (s < 0) {
-			cause = "socket";
-			continue;
-		}
-#ifdef XXXXX
-		if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
-			perror("rseb: tunnel setsockopt");
-			return -1;
-		}
-#endif
-		if (connect(s, res->ai_addr, res->ai_addrlen) < 0) {
-			cause = "connect";
-			close(s);
-			s = -1;
-			continue;
-		}
-
-		break;  /* okay we got one */
+	for (tunnel_res = tunnel_ai; s < 0 && tunnel_res; tunnel_res = tunnel_res->ai_next) {
+fprintf(stderr, "tunnel_res = %p\n", tunnel_res);
+		s = socket(tunnel_res->ai_family, tunnel_res->ai_socktype, 
+			tunnel_res->ai_protocol);
 	}
-	if (s < 0) {
-		Log(LOG_ERR, "tunnel failed: %s", cause);
+	if (s < 0 || !tunnel_res) {
+		Log(LOG_ERR, "tunnel socket failed, %s", s);
 		return -1;
 	}
-	freeaddrinfo(res0);
+	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
+		Log(LOG_ERR, "tunnel setsockopt failed, %s", strerror(errno));
+		return -1;
+	}
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = tunnel_res->ai_family;
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_protocol = IPPROTO_UDP;
+	hints.ai_flags = AI_ADDRCONFIG | AI_PASSIVE;
+	error = getaddrinfo(NULL, port_name, &hints, &tunnel_local_ai);
+	if (error) {
+        	Log(LOG_ERR, "getaddress failure for client tunnel source %s",
+			gai_strerror(error));
+                return -1;
+	}
+	if (bind(s, (struct sockaddr *)tunnel_local_ai->ai_addr,
+		tunnel_local_ai->ai_addrlen) < 0) {
+		Log(LOG_ERR, "listener bind to %s failed: %s",
+			sa_str((struct sockaddr *)tunnel_local_ai->ai_addr), strerror(errno));
+		return -1;
+	}
+	free(tunnel_local_ai);
 	return s;
 }
 
@@ -227,18 +247,24 @@ get_local_packet(void) {
 	return &p;
 }
 
-struct sockaddr from_addr;
-socklen_t sa_len = sizeof(from_addr);
-struct sockaddr *tunnel_sa = 0;	// NZ when we know who is connecting to us
+struct sockaddr *remote_tunnel_sa = 0;
+socklen_t remote_tunnel_sa_size;
 
 packet *
 read_tunneled_packet(void) {
+	struct sockaddr from_sa;
+	socklen_t from_sa_size;
 	static u_char buf[1500];
 	static packet p;
 
-	p.len = recvfrom(tfd, buf, sizeof(buf), 0, &from_addr, &sa_len);
+	p.len = recvfrom(tfd, buf, sizeof(buf), 0, &from_sa, &from_sa_size);
 	p.data = (const u_char *)&buf;
-	tunnel_sa = &from_addr;
+
+	if (!remote_tunnel_sa) {
+		remote_tunnel_sa = (struct sockaddr *)malloc(from_sa_size);
+		remote_tunnel_sa_size = from_sa_size;
+		Log(LOG_INFO, "Client at %s", sa_str(remote_tunnel_sa));
+	}
 //	dump_sa(from_sa);
 
 	return &p;
@@ -248,12 +274,13 @@ void
 send_packet_to_remote(packet *pkt) {
 	ssize_t n;
 
-	if (is_server && !tunnel_sa) {
+	if (is_server && !remote_tunnel_sa) {
 		Log(LOG_WARNING, "Tunnel transmission not established yet.");
 		return;
 	}
 
-	n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, tunnel_sa, sizeof(*tunnel_sa));
+	n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, 
+		(struct sockaddr *)tunnel_res->ai_addr, tunnel_res->ai_addrlen);
 	if (n < 0) {
 		Log(LOG_WARNING, "packet transmit error %s", strerror(errno));
 		return;
@@ -261,8 +288,9 @@ send_packet_to_remote(packet *pkt) {
 	if (n != pkt->len)
 		Log(LOG_WARNING, "send_packet_to_remote: short packet: %d %d",
 			n, pkt->len);
-	if (tunnel_sa)
-		Log(LOG_DEBUG, "sent %d bytes to tunnel %s", pkt->len, sa_str(tunnel_sa));
+	if (remote_tunnel_sa)
+		Log(LOG_DEBUG, "sent %d bytes to tunnel %s", pkt->len, 
+			sa_str(remote_tunnel_sa));
 	else
 		Log(LOG_DEBUG, "sent %d bytes to tunnel", pkt->len);
 }
@@ -349,7 +377,7 @@ main(int argc, char *argv[]) {
 	if (is_server) {
 		tfd = 0;
 	} else {
-		tfd = create_udp_tunnel_socket(remote_host, port);
+		tfd = create_udp_tunnel_to_server(remote_host, port);
 		if (tfd < 0)
 			return 11;
 	}
