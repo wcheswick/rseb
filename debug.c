@@ -2,11 +2,17 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <arpa/inet.h>
 #include <net/ethernet.h>
 #include <sys/socket.h>
 #include <net/if_arp.h>
+#include <netinet/ip.h>
+#include <netinet/in.h>
+#include <netdb.h>
+
+#include "rseb.h"
 
 const struct {
 	int type;
@@ -141,5 +147,47 @@ dump_ether_header(struct ether_header *hdr) {
 	ether_print(hdr->ether_dhost, dst);
 	fprintf(stderr, "%s > %s  %s", src, dst, e_type_str(hdr->ether_type));
 }
+
+
+#define IP_V(ip)   (((ip)->ip_v & 0xf0) >> 4)		// from tcpdump
+
+void
+dump_ip(packet *pkt) {
+	struct ip *ip = (struct ip *)&(pkt->data);
+	char src[200], dst[200];
+	int family, src_port, dst_port;
+
+	Log(LOG_DEBUG, "IPv%d packet, len = %d", ip->ip_v, pkt->len);
+
+}
+packet *pkt
 #endif
 
+char *
+sa_str(struct sockaddr *sa) {
+	static char obuf[200];
+	char buf[100];
+	int port;
+
+	switch (sa->sa_family) {
+	case AF_INET: {
+		struct sockaddr_in *sa4 = (struct sockaddr_in *)sa;
+		inet_ntop(sa->sa_family, &sa4->sin_addr,
+			buf, sizeof(buf));
+		port = ntohs(sa4->sin_port);
+		break;
+	}
+	case AF_INET6: {
+		struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)sa;
+		inet_ntop(sa->sa_family, &sa6->sin6_addr,
+			buf, sizeof(buf));
+		port = ntohs(sa6->sin6_port);
+		break;
+	}
+	default:
+		port = 0;
+		snprintf(buf, sizeof(buf), "dump_sa: unknown family: %d", sa->sa_family);
+	}
+	snprintf(obuf, sizeof(obuf), "%s:%d", buf, port);
+	return obuf;
+}

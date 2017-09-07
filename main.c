@@ -37,9 +37,10 @@
 #define RSEB_PORT	"1127"
 
 int debug = 0;
-int tfd = -1;		// tunnel connection
+int tfd = -1;
 int pcap_fd = -1;
 int use_syslog = 1;
+int is_server;
 
 pcap_t *pcap_handle;
 char pcap_err_buf[PCAP_ERRBUF_SIZE];
@@ -89,6 +90,34 @@ init_pcap(char *dev) {
 	}
 
 	return fd;
+}
+
+int
+create_udp_tunnel_listener(int port) {
+	int on = 1;
+	int s;
+	struct sockaddr_in nsaddr;
+
+	s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s < 0) {
+		Log(LOG_ERR, "listener failed: %s", strerror(errno));
+		return -1;
+	}
+	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+	    (char *)&on, sizeof(on)) != 0) {
+		Log(LOG_ERR, "listener setsockopt failed: %s", strerror(errno));
+		return -1;
+	}
+
+	memset(&nsaddr, 1, sizeof(nsaddr));
+	nsaddr.sin_family = AF_INET;		// XXX AF_INET ok?
+	nsaddr.sin_addr.s_addr = INADDR_ANY;
+	nsaddr.sin_port = htons(port);
+	if (bind(s, (struct sockaddr *)&nsaddr, sizeof(nsaddr))) {
+		Log(LOG_ERR, "listener bind failed: %s", strerror(errno));
+		return -1;
+	}
+	return s;
 }
 
 int
@@ -148,7 +177,7 @@ get_remote_name(int s) {
 	int port = 0;
 	
 	len = sizeof addr;
-	if (getpeername(s, (struct sockaddr*)&addr, &len) < 0) {
+	if (getpeername(s, (struct sockaddr *)&addr, &len) < 0) {
 		switch (errno) {
 		case ENOTSOCK:
 			return NULL;
@@ -198,20 +227,33 @@ get_local_packet(void) {
 	return &p;
 }
 
+struct sockaddr from_addr;
+socklen_t sa_len = sizeof(from_addr);
+struct sockaddr *tunnel_sa = 0;	// NZ when we know who is connecting to us
+
 packet *
-get_remote_packet(void) {
+read_tunneled_packet(void) {
 	static u_char buf[1500];
-	struct sockaddr sa;
-	socklen_t sa_len = sizeof(sa);
 	static packet p;
-	p.len = recvfrom(tfd, buf, sizeof(buf), 0, &sa, &sa_len);
+
+	p.len = recvfrom(tfd, buf, sizeof(buf), 0, &from_addr, &sa_len);
 	p.data = (const u_char *)&buf;
+	tunnel_sa = &from_addr;
+//	dump_sa(from_sa);
+
 	return &p;
 }
 
 void
 send_packet_to_remote(packet *pkt) {
-	ssize_t n = send(tfd, pkt->data, pkt->len, MSG_EOR);
+	ssize_t n;
+
+	if (is_server && !tunnel_sa) {
+		Log(LOG_WARNING, "Tunnel transmission not established yet.");
+		return;
+	}
+
+	n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, tunnel_sa, sizeof(*tunnel_sa));
 	if (n < 0) {
 		Log(LOG_WARNING, "packet transmit error %s", strerror(errno));
 		return;
@@ -219,7 +261,10 @@ send_packet_to_remote(packet *pkt) {
 	if (n != pkt->len)
 		Log(LOG_WARNING, "send_packet_to_remote: short packet: %d %d",
 			n, pkt->len);
-	Log(LOG_DEBUG, "sent %d bytes to %s", pkt->len, get_remote_name(tfd));
+	if (tunnel_sa)
+		Log(LOG_DEBUG, "sent %d bytes to tunnel %s", pkt->len, sa_str(tunnel_sa));
+	else
+		Log(LOG_DEBUG, "sent %d bytes to tunnel", pkt->len);
 }
 
 void
@@ -244,11 +289,19 @@ usage(void) {
 
 int
 main(int argc, char *argv[]) {
-	int is_server;
 	char *dev = 0;
 	char *port = RSEB_PORT;
 	char *remote_host = 0;
 	char *remote_end;
+
+	if (getuid() != 0) {
+		// because we need access to raw Ethernet packets on a given
+		// interface using pcap, both receiving and sending.
+
+		Log(LOG_ERR, "must be run as root");
+		fprintf(stderr, "rseb must be run as root\n");
+		return 4;
+	}
 
 	init_db();
 
@@ -293,24 +346,9 @@ main(int argc, char *argv[]) {
 		return usage();
 	}
 
-	if (getuid() != 0) {
-		// because we need access to raw Ethernet packets on a given
-		// interface using pcap, both receiving and sending.
-
-		Log(LOG_ERR, "must be run as root");
-		return 4;
-	}
-
-	// set up tunnel file descriptor
-
-	if (is_server) {	// inetd does the work here
-		char *remote_ip = get_remote_name(0);
-		if (remote_ip) {
-			tfd = 1; // stdout, from inetd
-		} else {
-			Log(LOG_ERR, "no tunnel connection");
-		}
-	} else {		// we open a UDP link to our remote selves
+	if (is_server) {
+		tfd = 0;
+	} else {
 		tfd = create_udp_tunnel_socket(remote_host, port);
 		if (tfd < 0)
 			return 11;
@@ -324,13 +362,12 @@ main(int argc, char *argv[]) {
 	signal(SIGHUP, interrupt);
 
 	remote_end = get_remote_name(tfd);
-	Log(LOG_INFO, "Bridging interface %s to %s", dev, remote_end);
 
-	if (!is_server) {
-		send_proto(Phello);
+	if (is_server) {
+		Log(LOG_INFO, "Server bridging interface %s", dev);
 	} else {
-Log(LOG_INFO, "server, fd 0 is %s", get_remote_name(0));
-Log(LOG_INFO, "server, fd 1 is %s", get_remote_name(1));
+		Log(LOG_INFO, "Bridging interface %s to %s", dev, remote_end);
+		send_proto(Phello);
 	}
 
 	while (1) {
@@ -347,8 +384,10 @@ Log(LOG_INFO, "server, fd 1 is %s", get_remote_name(1));
 		timeout.tv_usec = 0;
 		n = select(10, &fds, 0, 0, &timeout);
 		if (n < 0) {
+			if (errno == EINTR)
+				break;
 			Log(LOG_ERR, "select error: %s, %d, aborting",
-				strerror(errno), n);
+				strerror(errno), errno);
 			return 20;;
 		}
 
@@ -364,7 +403,7 @@ Log(LOG_INFO, "server, fd 1 is %s", get_remote_name(1));
 			busy = 1;
 		}
 		if (FD_ISSET(tfd, &fds)) { 	// something from the tunnel
-			pkt = get_remote_packet();
+			pkt = read_tunneled_packet();
 			if (!pkt)
 				continue;
 			if (pkt->len == PROTO_SIZE) {
@@ -377,23 +416,28 @@ Log(LOG_INFO, "server, fd 1 is %s", get_remote_name(1));
 				case Phelloback:
 					Log(LOG_INFO, "Remote end is alive");
 					break;
+				case Pheartbeat:
+					Log(LOG_INFO, "Lubdub");
+					break;
 				case Pbye:
 					Log(LOG_INFO, "Session terminated by other end");
 					return 0;
 				default:
 					Log(LOG_WARNING, "Unexpected protocol: %d", proto);
 				}
-			} else
-				Log(LOG_DEBUG, "packet received, length %d", pkt->len);
+			} else {
+//				Log(LOG_DEBUG, "packet received, length %d", pkt->len);
+			}
 			busy = 1;
 		}
 		if (!busy) {
+			send_proto(Pheartbeat);
 			Log(LOG_DEBUG, "timeout");
 dump_db();
 			usleep(500);	// microseconds
 		}
 	}
 
-	send_proto(Pbye);	// currently not executed
+	send_proto(Pbye);
 	return 0;
 }

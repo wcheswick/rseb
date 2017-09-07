@@ -1,14 +1,16 @@
 /* rseb.h */
 
+#include <sys/socket.h>
 #include <syslog.h>
 
 typedef enum packet_proto {
 	Phello,
 	Phelloback,
+	Pheartbeat = 0x01111111,
 	Pbye,
 } packet_proto;
 
-#define PROTO_SIZE	sizeof(int)
+#define PROTO_SIZE	sizeof(packet_proto)
 
 typedef struct packet {
 	ssize_t len;
@@ -35,6 +37,7 @@ extern	u_char ether_bcast[ETHER_ADDR_LEN];
 extern	char *e_hdr_str(struct ether_header *hdr);
 extern	char *edump(struct ether_header *hdr);
 extern	void ether_print(u_char *eaddr, char *buf);
+extern	char *sa_str(struct sockaddr *sa);
 
 /* db.c */
 extern	void init_db(void);

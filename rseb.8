@@ -385,3 +385,26 @@ Separation is poor between extended information and SNMP return.
 DNS should probably have an ANY query type.
 .Pp
 A plague of options.
+
+Bugs
+
+This program has no security.  It could be very easy to mis-deploy it.
+
+
+Security Considerations.
+
+By design, this program has no security.  There are no passwords, no keys, no
+encrypted connections, and no authentication of endpoints.  It is designed to be
+very easy to deploy, unlike many of the alternatives which motivated its creation.
+A server running this program is offering packet-level access to the network it is
+connected to, precisely as if an Ethernet were plugged into it.  
+
+This program links two Ethernets with no consideration for security.  It is even
+less secure than plugging two Ethernets into a bridge, since the server could accept
+connections from far away and allow injections and monitoring of a local network at
+the packet level.  
+
+This is the opposite of using enclaves and bulkheads to obstruct
+the spread of an attack through a network.
+If two separated enclaves need Ethernet-level connectivity, these packets should
+tunnel through a VPN or other trusted link.
