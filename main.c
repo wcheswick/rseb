@@ -128,11 +128,10 @@ make_sa(struct addrinfo *res, int use_ai, socklen_t *sa_length) {
 // For the server, it is extracted from the incoming connection information
 // in the first packet received.
 
-struct sockaddr *remote_tunnel_sa;
+struct sockaddr *remote_tunnel_sa = 0;
 socklen_t remote_tunnel_sa_size;
 
-struct addrinfo *tunnel_res;
-
+struct addrinfo *tunnel_res = 0;	// XXX this should be remote_tunnel_sa
 
 int
 create_udp_tunnel_to_server(char *host_name, char *port_name) {
@@ -152,13 +151,14 @@ create_udp_tunnel_to_server(char *host_name, char *port_name) {
                 return -1;
 	}
 
-	for (tunnel_res = tunnel_ai; s < 0 && tunnel_res; tunnel_res = tunnel_res->ai_next) {
-fprintf(stderr, "tunnel_res = %p\n", tunnel_res);
+	for (tunnel_res = tunnel_ai; tunnel_res; tunnel_res = tunnel_res->ai_next) {
 		s = socket(tunnel_res->ai_family, tunnel_res->ai_socktype, 
 			tunnel_res->ai_protocol);
+		if (s >= 0)
+			break;
 	}
 	if (s < 0 || !tunnel_res) {
-		Log(LOG_ERR, "tunnel socket failed, %s", s);
+		Log(LOG_ERR, "tunnel socket failed, %d, %p", s, tunnel_res);
 		return -1;
 	}
 	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
@@ -187,40 +187,6 @@ fprintf(stderr, "tunnel_res = %p\n", tunnel_res);
 	return s;
 }
 
-// returns NULL if fd is not a socket
-
-char *
-get_remote_name(int s) {
-	socklen_t len;
-	struct sockaddr_storage addr;
-	static char ipstr[INET6_ADDRSTRLEN];
-	int port = 0;
-	
-	len = sizeof addr;
-	if (getpeername(s, (struct sockaddr *)&addr, &len) < 0) {
-		switch (errno) {
-		case ENOTSOCK:
-			return NULL;
-		default:
-			return strerror(errno);
-		}
-	}
-	
-	if (addr.ss_family == AF_INET) {
-		struct sockaddr_in *s = (struct sockaddr_in *)&addr;
-		port = ntohs(s->sin_port);
-		inet_ntop(AF_INET, &s->sin_addr, ipstr, sizeof ipstr);
-	} else if (addr.ss_family == AF_INET6) {
-		struct sockaddr_in6 *s = (struct sockaddr_in6 *)&addr;
-		port = ntohs(s->sin6_port);
-		inet_ntop(AF_INET6, &s->sin6_addr, ipstr, sizeof ipstr);
-	} else {
-		snprintf(ipstr, sizeof(ipstr), "(unknown address family %d)",
-			addr.ss_family);
-	}
-	return ipstr;
-}
-
 packet *
 get_local_packet(void) {
 	struct pcap_pkthdr *phdr;
@@ -247,9 +213,6 @@ get_local_packet(void) {
 	return &p;
 }
 
-struct sockaddr *remote_tunnel_sa = 0;
-socklen_t remote_tunnel_sa_size;
-
 packet *
 read_tunneled_packet(void) {
 	struct sockaddr from_sa;
@@ -258,14 +221,15 @@ read_tunneled_packet(void) {
 	static packet p;
 
 	p.len = recvfrom(tfd, buf, sizeof(buf), 0, &from_sa, &from_sa_size);
+Log(LOG_INFO, "***** %d. %d", p.len, from_sa_size);
 	p.data = (const u_char *)&buf;
-
 	if (!remote_tunnel_sa) {
-		remote_tunnel_sa = (struct sockaddr *)malloc(from_sa_size);
+		Log(LOG_INFO, "Client at %s", sa_str(&from_sa));
 		remote_tunnel_sa_size = from_sa_size;
-		Log(LOG_INFO, "Client at %s", sa_str(remote_tunnel_sa));
+		remote_tunnel_sa = (struct sockaddr *)malloc(remote_tunnel_sa_size);
+		memcpy(remote_tunnel_sa, &from_sa, remote_tunnel_sa_size);
+		Log(LOG_INFO, "client at %s", sa_str(remote_tunnel_sa));
 	}
-//	dump_sa(from_sa);
 
 	return &p;
 }
@@ -278,9 +242,17 @@ send_packet_to_remote(packet *pkt) {
 		Log(LOG_WARNING, "Tunnel transmission not established yet.");
 		return;
 	}
+	if (tunnel_res)
+		n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, 
+			(struct sockaddr *)tunnel_res->ai_addr, tunnel_res->ai_addrlen);
+	else if (remote_tunnel_sa)
+		n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, 
+			remote_tunnel_sa, remote_tunnel_sa_size);
+	else {
+		Log(LOG_WARNING, "huh?");
+		n = -1;
+	}
 
-	n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, 
-		(struct sockaddr *)tunnel_res->ai_addr, tunnel_res->ai_addrlen);
 	if (n < 0) {
 		Log(LOG_WARNING, "packet transmit error %s", strerror(errno));
 		return;
@@ -320,7 +292,6 @@ main(int argc, char *argv[]) {
 	char *dev = 0;
 	char *port = RSEB_PORT;
 	char *remote_host = 0;
-	char *remote_end;
 
 	if (getuid() != 0) {
 		// because we need access to raw Ethernet packets on a given
@@ -389,12 +360,10 @@ main(int argc, char *argv[]) {
 	signal(SIGINT, interrupt);
 	signal(SIGHUP, interrupt);
 
-	remote_end = get_remote_name(tfd);
-
 	if (is_server) {
 		Log(LOG_INFO, "Server bridging interface %s", dev);
 	} else {
-		Log(LOG_INFO, "Bridging interface %s to %s", dev, remote_end);
+		Log(LOG_INFO, "Bridging interface %s", dev);
 		send_proto(Phello);
 	}
 
