@@ -36,9 +36,12 @@
 #include "arg.h"
 
 #define RSEB_PORT	"1127"
+#define REPORT_INTERVAL	(60*60)	// in seconds
 
 int debug = 0;
 int use_syslog = 1;
+
+int report_time = 0;
 
 int tfd = -1;		// for the tunnel to the remote
 int pcap_fd = -1;	// from the local interface
@@ -234,12 +237,17 @@ get_local_packet(void) {
 	return &p;
 }
 
+int warned = 0;
+
 void
 send_packet_to_remote(packet *pkt) {
 	ssize_t n;
 
 	if (is_server && !remote_tunnel_sa) {
-		Log(LOG_WARNING, "Tunnel transmission not established yet.");
+		if (!warned) {
+			Log(LOG_INFO, "Awaiting first incoming tunnel packet");
+			warned = 1;
+		}
 		return;
 	}
 	n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, 
@@ -252,8 +260,7 @@ send_packet_to_remote(packet *pkt) {
 		Log(LOG_WARNING, "send_packet_to_remote: short packet: %d %d",
 			n, pkt->len);
 	if (remote_tunnel_sa)
-		Log(LOG_DEBUG, "<<<<< %d to %s", pkt->len, 
-			sa_str(remote_tunnel_sa));
+		Log(LOG_DEBUG, "L >>>>>  %s", pkt_str(pkt));;
 }
 
 void
@@ -279,40 +286,33 @@ read_tunneled_packet(void) {
 		// conversation.  XX we should comment if someone else
 		// doesn't butt in, at least without comment.
 
-		Log(LOG_INFO, "Client at %s", sa_str(&from_sa));
+		Log(LOG_INFO, "Tunnel established from %s", sa_str(&from_sa));
+		warned = 0;
 		remote_tunnel_sa_size = from_sa_size;
 		remote_tunnel_sa = (struct sockaddr *)malloc(remote_tunnel_sa_size);
 		memcpy(remote_tunnel_sa, &from_sa, remote_tunnel_sa_size);
 	}
-Log(LOG_DEBUG, ">>>>> %2d %s", p.len, sa_str(remote_tunnel_sa));
+	Log(LOG_DEBUG, "L <<<<<  %s", pkt_str(&p)); //sa_str(remote_tunnel_sa));
 
 	return &p;
 }
 
 void
 inject_packet_from_remote(packet *pkt) {
-	int n = pcap_sendpacket(pcap_handle, pkt->data, pkt->len);
-Log(LOG_DEBUG, "injected %d", pkt->len);
+	int n;
 
+	n = pcap_sendpacket(pcap_handle, pkt->data, pkt->len);
 	if (n < 0) {
 		Log(LOG_WARNING, "pcap raw write error: %s",
 			pcap_geterr(pcap_handle));
 	}
-#ifdef bad
-	struct sockaddr_ll sa;
-	struct ether_header *eh = (struct ether_header *) pkt->data;
-	int n;
-
-	sa.sll_ifindex = if_idx.ifr_ifindex;
-	sa.sll_halen = ETH_ALEN;
-	memcpy(sa.sll_addr, &eh->ether_dhost, ETHER_ADDR_LEN);
-
-	n = (sendto(raw_fd, pkt->data, pkt->len, 0, 
-		(struct sockaddr*)&sa, sizeof(sa));
- 	if (n < 0) {
-#endif
 }
 
+void
+do_report(void) {
+	dump_local_eaddrs();
+	dump_remote_eaddrs();
+}
 
 void
 interrupt(int i) {
@@ -360,6 +360,9 @@ main(int argc, char *argv[]) {
 		break;
 	case 'p':
 		port = ARGF();
+		break;
+	case 'r':
+		report_time = now() + REPORT_INTERVAL;
 		break;
 	case 's':
 		use_syslog = 0;
@@ -474,45 +477,58 @@ main(int argc, char *argv[]) {
 			pkt = get_local_packet();
 			if (!pkt)
 				continue;
-			add_entry(ETHER(pkt)->ether_shost);
-			if (IS_EBCAST(ETHER(pkt)->ether_dhost) ||
-			    !known_entry(ETHER(pkt)->ether_dhost)) {
+
+			// see if we are sniffing our own bridged traffic
+			if (known_remote_eaddr(ETHER(pkt)->ether_shost))
+				continue;
+
+			// if destination is known to be local, don't forward
+			if (known_local_eaddr(ETHER(pkt)->ether_dhost))
+				continue;
+			add_local_eaddr(ETHER(pkt)->ether_shost); // remember local src
+			if (IS_EBCAST(ETHER(pkt)->ether_dhost)) {
 				send_packet_to_remote(pkt);
 			}
 			busy = 1;
 		}
-		if (FD_ISSET(tfd, &fds)) { 	// something from the tunnel
+		if (FD_ISSET(tfd, &fds)) { 	// remote from the tunnel
 			pkt = read_tunneled_packet();
 			if (!pkt)
 				continue;
-			if (pkt->len == PROTO_SIZE) {
+			if (IS_PROTO(pkt)) {
 				int proto = *(int *)pkt->data;
 				switch (proto) {
 				case Phello:
-					Log(LOG_INFO, "Session started at other end");
+					Log(LOG_INFO, "Remote started tunnel session");
 					send_proto(Phelloback);
 					break;
 				case Phelloback:
 					Log(LOG_INFO, "Remote end is alive");
 					break;
 				case Pheartbeat:
-					Log(LOG_INFO, "Lubdub");
+					// Log(LOG_INFO, "Lubdub");
 					break;
 				case Pbye:
 					Log(LOG_INFO, "Session terminated by other end");
 					return 0;
 				default:
-					Log(LOG_WARNING, "Unexpected protocol: %d", proto);
+					Log(LOG_WARNING, "Unexpected protocol: %d",
+						proto);
 				}
 			} else {
+				add_remote_eaddr(ETHER(pkt)->ether_shost);
 				inject_packet_from_remote(pkt);
 			}
 			busy = 1;
 		}
 		if (!busy) {
+			time_t t = now();
+			if (report_time && t > report_time) {
+				do_report();
+				report_time = t + REPORT_INTERVAL;
+			}
 			send_proto(Pheartbeat);
 			Log(LOG_DEBUG, "timeout");
-dump_db();
 			usleep(500);	// microseconds
 		}
 	}

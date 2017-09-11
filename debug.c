@@ -164,6 +164,16 @@ packet *pkt
 #endif
 
 char *
+pkt_str(packet *p) {
+//	struct ether_header *hdr = (struct ether_header *)p->data;
+//	char *ehdr = e_hdr_str(hdr);
+
+	if (IS_PROTO(p))
+		return "(protocol)";
+	return hex((void *)p->data);
+}
+
+char *
 sa_str(struct sockaddr *sa) {
 	static char obuf[200];
 	char buf[100];
