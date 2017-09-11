@@ -1,0 +1,27 @@
+#!/bin/sh
+
+#
+# PROVIDE: rseb
+# REQUIRE: SERVERS
+# BEFORE:  
+# KEYWORD: shutdown
+#
+# Add the following lines to /etc/rc.conf.local or /etc/rc.conf
+# to enable this service:
+#
+# rseb_enable (bool):	Set to NO by default.
+#			Set it to YES to enable rseb.
+
+. /etc/rc.subr
+
+name=rseb
+rcvar="${name}_enable"
+command="/usr/local/sbin/${name}"
+
+load_rc_config $name
+
+: ${rseb_enable:="NO"}
+
+command_args=""
+
+run_rc_command "$1"

@@ -22,6 +22,7 @@
 #include <sys/select.h>
 #include <pcap.h>
 #include <net/ethernet.h>
+#include <net/if.h>
 
 #ifdef __FreeBSD__
 #include <sys/sockio.h>
@@ -37,15 +38,21 @@
 #define RSEB_PORT	"1127"
 
 int debug = 0;
-int tfd = -1;
-int pcap_fd = -1;
 int use_syslog = 1;
+
+int tfd = -1;		// for the tunnel to the remote
+int pcap_fd = -1;	// from the local interface
+struct ifreq if_idx;	// for writing to the raw interface
+
 int is_server;
+sa_family_t family = AF_UNSPEC;	// AF_INET or AF_INET6
 
 pcap_t *pcap_handle;
 char pcap_err_buf[PCAP_ERRBUF_SIZE];
 
 #define PCAP_FILTER	"arp"
+
+#define	SYSLOG_SERVICE	LOG_LOCAL1
 
 
 
@@ -92,98 +99,112 @@ init_pcap(char *dev) {
 	return fd;
 }
 
+// bind to the client end of the tunnel to the server.
 
-// Construct a sockaddr for either inet or inet6.  if use_ai is true, use the host
-// information from addrinfo, else the appropriate version of INADDR_ANY.
+int
+bind_local_udp(int s, char *port_name) {
+	struct addrinfo hints;
+        struct addrinfo *tunnel_local_ai;
+	int rc;
 
-struct sockaddr *
-make_sa(struct addrinfo *res, int use_ai, socklen_t *sa_length) {
-	struct sockaddr *sa;
-
-	*sa_length = res->ai_addrlen;
-	sa = (struct sockaddr *)malloc(*sa_length);
-	memcpy(sa, res->ai_addr, *sa_length);
-
-	// set local listening address if not use_ai
-
-	switch (sa->sa_family) {
-		case AF_INET: {
-			struct sockaddr_in *sa4 = (struct sockaddr_in *)sa;
-			sa4->sin_addr.s_addr = INADDR_ANY;
-//			sa4->sin_port = htons(port);
-			break;
-		}
-		case AF_INET6: {
-			struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)sa;
-			sa6->sin6_addr = in6addr_any;
-//			sa6->sin6_port = htons(port);
-			break;
-		}
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = family;
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_protocol = IPPROTO_UDP;
+	hints.ai_flags = AI_ADDRCONFIG | AI_PASSIVE;
+	rc = getaddrinfo(NULL, port_name, &hints, &tunnel_local_ai);
+	if (rc) {
+		Log(LOG_ERR, "getaddress failure for client tunnel source %s",
+		        gai_strerror(rc));
+		return -1;
 	}
-	Log(LOG_DEBUG, "make_sa: %s", sa_str(sa));
-	return sa;
+
+	if (bind(s, (struct sockaddr *)tunnel_local_ai->ai_addr,
+	    tunnel_local_ai->ai_addrlen) < 0) {
+		Log(LOG_ERR, "listener bind to %s failed: %s",
+		        sa_str((struct sockaddr *)tunnel_local_ai->ai_addr), strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+struct sockaddr *remote_tunnel_sa = 0;	// filled in when we know we are talking to
+socklen_t remote_tunnel_sa_size;
+
+int
+create_udp_tunnel_server_listener(char *port_name) {
+	int on = 1;
+	int s = -1;
+
+	s = socket(family, SOCK_DGRAM, IPPROTO_UDP);
+	if (s < 0) {
+        	Log(LOG_ERR, "socket failure: %s", strerror(errno));
+                return -1;
+	}
+
+	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+	    (char *)&on, sizeof(on)) != 0) {
+		perror("portinit setsockopt");
+		exit(13);
+	}
+
+	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
+		Log(LOG_ERR, "tunnel setsockopt failed, %s", strerror(errno));
+		return -1;
+	}
+	if (bind_local_udp(s, port_name) < 0) {
+		return -1;
+	}
+
+	Log(LOG_DEBUG, "listener started");
+	return s;
 }
 
 // For the client, this information is derived from the supplied host name/port
 // For the server, it is extracted from the incoming connection information
 // in the first packet received.
 
-struct sockaddr *remote_tunnel_sa = 0;
-socklen_t remote_tunnel_sa_size;
-
-struct addrinfo *tunnel_res = 0;	// XXX this should be remote_tunnel_sa
 
 int
 create_udp_tunnel_to_server(char *host_name, char *port_name) {
-	int on = 1;
-	int s = -1;
-	static struct addrinfo hints,  *tunnel_ai;
-	int error;
-	struct addrinfo *tunnel_local_ai;
+        int on = 1;
+        int s = -1;
+	struct addrinfo hints;
+	int rc;
+        struct addrinfo *tunnel_ai, *tunnel_res;
 
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_DGRAM;
-	hints.ai_protocol = IPPROTO_UDP;
-	error = getaddrinfo(host_name, port_name, &hints, &tunnel_ai);
-	if (error) {
-        	Log(LOG_ERR, "getaddress failure:%s", gai_strerror(error));
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = family;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_protocol = IPPROTO_UDP;
+        rc = getaddrinfo(host_name, port_name, &hints, &tunnel_ai);
+        if (rc) {
+                Log(LOG_ERR, "getaddress failure:%s", gai_strerror(rc));
                 return -1;
-	}
+        }
 
-	for (tunnel_res = tunnel_ai; tunnel_res; tunnel_res = tunnel_res->ai_next) {
-		s = socket(tunnel_res->ai_family, tunnel_res->ai_socktype, 
-			tunnel_res->ai_protocol);
-		if (s >= 0)
-			break;
-	}
-	if (s < 0 || !tunnel_res) {
-		Log(LOG_ERR, "tunnel socket failed, %d, %p", s, tunnel_res);
-		return -1;
-	}
-	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
-		Log(LOG_ERR, "tunnel setsockopt failed, %s", strerror(errno));
-		return -1;
-	}
-
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = tunnel_res->ai_family;
-	hints.ai_socktype = SOCK_DGRAM;
-	hints.ai_protocol = IPPROTO_UDP;
-	hints.ai_flags = AI_ADDRCONFIG | AI_PASSIVE;
-	error = getaddrinfo(NULL, port_name, &hints, &tunnel_local_ai);
-	if (error) {
-        	Log(LOG_ERR, "getaddress failure for client tunnel source %s",
-			gai_strerror(error));
+        for (tunnel_res = tunnel_ai; tunnel_res; tunnel_res = tunnel_res->ai_next) {
+                s = socket(tunnel_res->ai_family, tunnel_res->ai_socktype, 
+                        tunnel_res->ai_protocol);
+                if (s >= 0)
+                        break;
+        }
+        if (s < 0) {
+                Log(LOG_ERR, "tunnel socket failed, %d, %p", s, tunnel_res);
                 return -1;
-	}
-	if (bind(s, (struct sockaddr *)tunnel_local_ai->ai_addr,
-		tunnel_local_ai->ai_addrlen) < 0) {
-		Log(LOG_ERR, "listener bind to %s failed: %s",
-			sa_str((struct sockaddr *)tunnel_local_ai->ai_addr), strerror(errno));
+        }
+        if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
+                Log(LOG_ERR, "tunnel setsockopt failed, %s", strerror(errno));
+                return -1;
+        }
+	if (bind_local_udp(s, port_name) < 0)
 		return -1;
-	}
-	free(tunnel_local_ai);
+
+	remote_tunnel_sa_size = tunnel_res->ai_addrlen;
+	remote_tunnel_sa = (struct sockaddr *)malloc(remote_tunnel_sa_size);
+	memcpy(remote_tunnel_sa, tunnel_res->ai_addr, remote_tunnel_sa_size);
+
+	free(tunnel_res);
 	return s;
 }
 
@@ -213,27 +234,6 @@ get_local_packet(void) {
 	return &p;
 }
 
-packet *
-read_tunneled_packet(void) {
-	struct sockaddr from_sa;
-	socklen_t from_sa_size;
-	static u_char buf[1500];
-	static packet p;
-
-	p.len = recvfrom(tfd, buf, sizeof(buf), 0, &from_sa, &from_sa_size);
-Log(LOG_INFO, "***** %d. %d", p.len, from_sa_size);
-	p.data = (const u_char *)&buf;
-	if (!remote_tunnel_sa) {
-		Log(LOG_INFO, "Client at %s", sa_str(&from_sa));
-		remote_tunnel_sa_size = from_sa_size;
-		remote_tunnel_sa = (struct sockaddr *)malloc(remote_tunnel_sa_size);
-		memcpy(remote_tunnel_sa, &from_sa, remote_tunnel_sa_size);
-		Log(LOG_INFO, "client at %s", sa_str(remote_tunnel_sa));
-	}
-
-	return &p;
-}
-
 void
 send_packet_to_remote(packet *pkt) {
 	ssize_t n;
@@ -242,17 +242,8 @@ send_packet_to_remote(packet *pkt) {
 		Log(LOG_WARNING, "Tunnel transmission not established yet.");
 		return;
 	}
-	if (tunnel_res)
-		n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, 
-			(struct sockaddr *)tunnel_res->ai_addr, tunnel_res->ai_addrlen);
-	else if (remote_tunnel_sa)
-		n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, 
-			remote_tunnel_sa, remote_tunnel_sa_size);
-	else {
-		Log(LOG_WARNING, "huh?");
-		n = -1;
-	}
-
+	n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, 
+		remote_tunnel_sa, remote_tunnel_sa_size);
 	if (n < 0) {
 		Log(LOG_WARNING, "packet transmit error %s", strerror(errno));
 		return;
@@ -261,10 +252,8 @@ send_packet_to_remote(packet *pkt) {
 		Log(LOG_WARNING, "send_packet_to_remote: short packet: %d %d",
 			n, pkt->len);
 	if (remote_tunnel_sa)
-		Log(LOG_DEBUG, "sent %d bytes to tunnel %s", pkt->len, 
+		Log(LOG_DEBUG, "<<<<< %d to %s", pkt->len, 
 			sa_str(remote_tunnel_sa));
-	else
-		Log(LOG_DEBUG, "sent %d bytes to tunnel", pkt->len);
 }
 
 void
@@ -275,6 +264,56 @@ send_proto(int proto_msg) {
 	send_packet_to_remote(&p);
 }
 
+packet *
+read_tunneled_packet(void) {
+	struct sockaddr from_sa;
+	socklen_t from_sa_size = sizeof(from_sa);
+	static u_char buf[1500];
+	static packet p;
+
+	p.len = recvfrom(tfd, buf, sizeof(buf), 0, &from_sa, &from_sa_size);
+	p.data = (const u_char *)&buf;
+	if (!remote_tunnel_sa) {
+		// This is the first connection to this server.  We save
+		// the info about the caller so we can continue the
+		// conversation.  XX we should comment if someone else
+		// doesn't butt in, at least without comment.
+
+		Log(LOG_INFO, "Client at %s", sa_str(&from_sa));
+		remote_tunnel_sa_size = from_sa_size;
+		remote_tunnel_sa = (struct sockaddr *)malloc(remote_tunnel_sa_size);
+		memcpy(remote_tunnel_sa, &from_sa, remote_tunnel_sa_size);
+	}
+Log(LOG_DEBUG, ">>>>> %2d %s", p.len, sa_str(remote_tunnel_sa));
+
+	return &p;
+}
+
+void
+inject_packet_from_remote(packet *pkt) {
+	int n = pcap_sendpacket(pcap_handle, pkt->data, pkt->len);
+Log(LOG_DEBUG, "injected %d", pkt->len);
+
+	if (n < 0) {
+		Log(LOG_WARNING, "pcap raw write error: %s",
+			pcap_geterr(pcap_handle));
+	}
+#ifdef bad
+	struct sockaddr_ll sa;
+	struct ether_header *eh = (struct ether_header *) pkt->data;
+	int n;
+
+	sa.sll_ifindex = if_idx.ifr_ifindex;
+	sa.sll_halen = ETH_ALEN;
+	memcpy(sa.sll_addr, &eh->ether_dhost, ETHER_ADDR_LEN);
+
+	n = (sendto(raw_fd, pkt->data, pkt->len, 0, 
+		(struct sockaddr*)&sa, sizeof(sa));
+ 	if (n < 0) {
+#endif
+}
+
+
 void
 interrupt(int i) {
 	Log(LOG_DEBUG, "interrupt %d, terminating", i);
@@ -283,7 +322,7 @@ interrupt(int i) {
 
 int
 usage(void) {
-	Log(LOG_ERR, "usage: rseb [-d [-d]] [-s] [-i interface] [remote ip [remote port]]");
+	fprintf(stderr, "usage: rseb [-d [-d]] [-D] [-i interface] [-p port] [-s] [remote server ip]");
 	return 1;
 }
 
@@ -292,6 +331,8 @@ main(int argc, char *argv[]) {
 	char *dev = 0;
 	char *port = RSEB_PORT;
 	char *remote_host = 0;
+	int detach = 0;
+	int lflag = 0;
 
 	if (getuid() != 0) {
 		// because we need access to raw Ethernet packets on a given
@@ -308,27 +349,30 @@ main(int argc, char *argv[]) {
 	case 'd':
 		debug++;
 		break;
+	case 'D':
+		detach = 1;
+		break;
 	case 'i':
 		dev = ARGF();
 		break;
+	case 'l':
+		lflag = 1;	// not inetd, and not detached
+		break;
+	case 'p':
+		port = ARGF();
+		break;
 	case 's':
-		use_syslog = 0;		// stderr instead
+		use_syslog = 0;
+		break;
+	case '4':
+		family = AF_INET;
+		break;
+	case '6':
+		family = AF_INET6;
 		break;
 	default:
 		return usage();
 	} ARGEND;
-
-	if (use_syslog)
-		openlog("rseb", LOG_CONS, LOG_DAEMON);
-
-	if (!dev) {
-		dev = pcap_lookupdev(pcap_err_buf);
-		if (dev == NULL) {
-			Log(LOG_ERR, "pcap cannot find default device: %s",
-				pcap_err_buf);
-			return 10;
-		}
-	}
 
 	switch (argc) {
 	case 0:
@@ -345,12 +389,50 @@ main(int argc, char *argv[]) {
 		return usage();
 	}
 
+	if (!dev) {
+		dev = pcap_lookupdev(pcap_err_buf);
+		if (dev == NULL) {
+			Log(LOG_ERR, "pcap cannot find default device: %s",
+				pcap_err_buf);
+			return 10;
+		}
+	}
+
+	if (detach) {
+		use_syslog = 1;
+		switch (fork()) {
+		case -1:
+			perror("detaching");
+			exit(1);
+		case 0:
+			setsid();
+			break;
+		default:
+			exit(0);
+		}
+	}
+	if (use_syslog)
+		openlog("rseb", LOG_CONS, SYSLOG_SERVICE);
+
 	if (is_server) {
-		tfd = 0;
+		if (detach || lflag) {
+			if (family == AF_UNSPEC)
+				family = AF_INET;
+			tfd = create_udp_tunnel_server_listener(port);
+			if (tfd < 0)
+				return 11;
+		} else
+			tfd = 0;	// stdin, probably from inetd
 	} else {
+		if (family == AF_UNSPEC) {
+			if (strchr(remote_host, ':'))
+				family = AF_INET6;
+			else
+				family = AF_INET;
+		}
 		tfd = create_udp_tunnel_to_server(remote_host, port);
 		if (tfd < 0)
-			return 11;
+			return 12;
 	}
 
 	pcap_fd = init_pcap(dev);
@@ -423,7 +505,7 @@ main(int argc, char *argv[]) {
 					Log(LOG_WARNING, "Unexpected protocol: %d", proto);
 				}
 			} else {
-//				Log(LOG_DEBUG, "packet received, length %d", pkt->len);
+				inject_packet_from_remote(pkt);
 			}
 			busy = 1;
 		}
