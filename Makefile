@@ -35,7 +35,7 @@ clean::
 
 test::	rseb
 #	sudo ./rseb -d -d -D
-	sudo ./rseb -d -d -s tunnel-garage.local	# client test
+	sudo ./rseb -d -e tunnel-garage.local	# client test
 
 #	sudo ./rseb -d -d fd72:6574:6e65:7466::20
 #	sudo ./rseb -d		# discover interface

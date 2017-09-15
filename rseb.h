@@ -6,12 +6,13 @@
 typedef enum packet_proto {
 	Phello,
 	Phelloback,
-	Pheartbeat = 0x01111111,
+	Pheartbeat,
 	Pbye,
 } packet_proto;
 
 #define PROTO_SIZE	sizeof(packet_proto)
 #define IS_PROTO(p)	((p)->len == PROTO_SIZE)
+#define PROTO(pkt)	(*(int *)(pkt)->data)
 
 typedef struct packet {
 	ssize_t len;
@@ -35,10 +36,10 @@ extern	u_char ether_bcast[ETHER_ADDR_LEN];
 
 /* debug.c */
 extern	char *e_hdr_str(struct ether_header *hdr);
-extern	char *edump(struct ether_header *hdr);
 extern	void ether_print(u_char *eaddr, char *buf);
 extern	char *sa_str(struct sockaddr *sa);
 extern	char *pkt_str(packet *p);
+extern	char *tunnel_str(packet *tp);
 
 /* db.c */
 extern	void init_db(void);

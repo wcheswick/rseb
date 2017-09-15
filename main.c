@@ -12,17 +12,21 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <net/ethernet.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/in_systm.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
 #include <arpa/inet.h>
+#include <netinet/ip_icmp.h>
+#include <netinet/udp.h>
+#include <netinet/tcp.h>
 #include <sys/un.h>
 #include <stdarg.h>
 #include <sys/select.h>
 #include <pcap.h>
-#include <net/ethernet.h>
-#include <net/if.h>
+
 
 #ifdef __FreeBSD__
 #include <sys/sockio.h>
@@ -36,12 +40,28 @@
 #include "arg.h"
 
 #define RSEB_PORT	"1127"
-#define REPORT_INTERVAL	(60*60)	// in seconds
+#define REPORT_INTERVAL	(60)	// in minutes
 
 int debug = 0;
 int use_syslog = 1;
 
-int report_time = 0;
+int report_time = REPORT_INTERVAL;
+
+int local_packets_sniffed = 0;
+int local_bytes_sniffed = 0;
+int local_packets_not_needing_tunnel = 0;
+int loopback_packets_ignored = 0;
+int incoming_tunnel_packets = 0;
+int incoming_tunnel_bytes = 0;
+int outgoing_tunnel_packets = 0;
+int outgoing_tunnel_bytes = 0;
+int incoming_proto_packets = 0;
+int outgoing_proto_packets = 0;
+int short_packets = 0;
+int empty_packets = 0;
+
+int reports = 0;
+int not_busy = 0;
 
 int tfd = -1;		// for the tunnel to the remote
 int pcap_fd = -1;	// from the local interface
@@ -53,7 +73,7 @@ sa_family_t family = AF_UNSPEC;	// AF_INET or AF_INET6
 pcap_t *pcap_handle;
 char pcap_err_buf[PCAP_ERRBUF_SIZE];
 
-#define PCAP_FILTER	"arp"
+#define PCAP_FILTER	"not ip6 and not udp port 1127"
 
 #define	SYSLOG_SERVICE	LOG_LOCAL1
 
@@ -98,6 +118,13 @@ init_pcap(char *dev) {
 			dev);
 		return -1;
 	}
+#ifdef notdef
+	if (pcap_setdirection(pcap_handle, PCAP_D_IN) < 0) {
+		Log(LOG_ERR, "pcap_setdirection failed for '%s': %s", 
+			dev, pcap_geterr(pcap_handle));
+		return -1;
+	}
+#endif
 
 	return fd;
 }
@@ -211,11 +238,31 @@ create_udp_tunnel_to_server(char *host_name, char *port_name) {
 	return s;
 }
 
+int
+unwanted_packet(packet *p) {
+	struct ether_header *ehdr;
+	if (!p)
+		return 1;
+
+	ehdr = (struct ether_header *)p->data;
+	switch (ntohs(ehdr->ether_type)) {
+	case ETHERTYPE_ARP:
+		return 0;
+	case ETHERTYPE_IP:
+		return 0;
+	case ETHERTYPE_IPV6:
+abort();
+		return 1;
+	default:
+		return 1;
+	}
+	return 1;
+}
+
 packet *
 get_local_packet(void) {
 	struct pcap_pkthdr *phdr;
 	static packet p;
-	struct ether_header *ehdr;
 	int rc = pcap_next_ex(pcap_handle, &phdr, &p.data);
 	switch (rc) {
 	case 0:		// timeout
@@ -224,14 +271,14 @@ get_local_packet(void) {
 	case 1:		// have a packet
 		break;
 	default:	// some error
-		Log(LOG_WARNING, "pcap_next_ex error: %s", pcap_geterr(pcap_handle));
+		Log(LOG_WARNING, "pcap_next_ex error (%d): %s", 
+			rc, pcap_geterr(pcap_handle));
 		return 0;
 	}
 
-	ehdr = (struct ether_header *)p.data;
-	Log(LOG_DEBUG, "  local: %s", edump(ehdr));
-	if (phdr->caplen != phdr->len) {
-		Log(LOG_WARNING, "short packet, %d != %d", phdr->caplen != phdr->len);
+	if (phdr->len == 0) {
+		empty_packets++;
+		return 0;
 	}
 	p.len = phdr->caplen;
 	return &p;
@@ -259,13 +306,12 @@ send_packet_to_remote(packet *pkt) {
 	if (n != pkt->len)
 		Log(LOG_WARNING, "send_packet_to_remote: short packet: %d %d",
 			n, pkt->len);
-	if (remote_tunnel_sa)
-		Log(LOG_DEBUG, "L >>>>>  %s", pkt_str(pkt));;
 }
 
 void
 send_proto(int proto_msg) {
 	packet p;
+	outgoing_proto_packets++;
 	p.data = (void *)&proto_msg;
 	p.len = sizeof(proto_msg);
 	send_packet_to_remote(&p);
@@ -284,16 +330,20 @@ read_tunneled_packet(void) {
 		// This is the first connection to this server.  We save
 		// the info about the caller so we can continue the
 		// conversation.  XX we should comment if someone else
-		// doesn't butt in, at least without comment.
+		// butts in
 
 		Log(LOG_INFO, "Tunnel established from %s", sa_str(&from_sa));
 		warned = 0;
 		remote_tunnel_sa_size = from_sa_size;
 		remote_tunnel_sa = (struct sockaddr *)malloc(remote_tunnel_sa_size);
 		memcpy(remote_tunnel_sa, &from_sa, remote_tunnel_sa_size);
-	}
-	Log(LOG_DEBUG, "L <<<<<  %s", pkt_str(&p)); //sa_str(remote_tunnel_sa));
 
+		// we should not forward any traffic through the tunnel that
+		// has the remote ethernet in it.  I think.
+		// XXX what about at the client?
+
+		add_local_eaddr(ETHER(&p)->ether_shost);
+	}
 	return &p;
 }
 
@@ -310,8 +360,41 @@ inject_packet_from_remote(packet *pkt) {
 
 void
 do_report(void) {
+	reports++;
+	Log(LOG_NOTICE, "   Tunnel incoming packets: %d", incoming_tunnel_packets);
+	Log(LOG_NOTICE, "                     bytes: %d", incoming_tunnel_bytes);
+	Log(LOG_NOTICE, "             proto packets: %d", incoming_proto_packets);
+	Log(LOG_NOTICE, "   Tunnel outgoing packets: %d", outgoing_tunnel_packets);
+	Log(LOG_NOTICE, "                     bytes: %d", outgoing_tunnel_bytes);
+	Log(LOG_NOTICE, "             proto packets: %d", outgoing_proto_packets);
+	Log(LOG_NOTICE, "     Local packets sniffed: %d", local_packets_sniffed);
+	Log(LOG_NOTICE, "                   ignored: %d", loopback_packets_ignored);
+	Log(LOG_NOTICE, "             not forwarded: %d", local_packets_not_needing_tunnel);
+	Log(LOG_NOTICE, "             short packets: %d", short_packets);
+	Log(LOG_NOTICE, "             empty packets: %d", empty_packets);
+	Log(LOG_NOTICE, "             bytes sniffed: %d", local_bytes_sniffed);
+	Log(LOG_NOTICE, "       bytes not forwarded: %d",
+	    local_bytes_sniffed - outgoing_tunnel_bytes);
+	Log(LOG_NOTICE, "          bridge reduction  %.2f %%",
+	    100.0*(local_bytes_sniffed - outgoing_tunnel_bytes)/(double)local_bytes_sniffed);
+
+	incoming_tunnel_packets = 0;
+	incoming_tunnel_bytes = 0;
+	incoming_proto_packets = 0;
+	outgoing_tunnel_packets = 0;
+	outgoing_tunnel_bytes = 0;
+	outgoing_proto_packets = 0;
+	local_packets_sniffed = 0;
+	local_bytes_sniffed = 0;
+	loopback_packets_ignored = 0;
+	local_packets_not_needing_tunnel = 0;
+	short_packets = 0;
+
+	Log(LOG_INFO, "Local Ethernet address cache:");
 	dump_local_eaddrs();
+	Log(LOG_INFO, "Remote Ethernet address cache:");
 	dump_remote_eaddrs();
+	Log(LOG_INFO, "Reports generated: %d", reports);
 }
 
 void
@@ -322,7 +405,7 @@ interrupt(int i) {
 
 int
 usage(void) {
-	fprintf(stderr, "usage: rseb [-d [-d]] [-D] [-i interface] [-p port] [-s] [remote server ip]");
+	fprintf(stderr, "usage: rseb [-d [-d]] [-D] [-e] [-i interface] [-p port] [-r minutes] [remote server ip]");
 	return 1;
 }
 
@@ -333,6 +416,7 @@ main(int argc, char *argv[]) {
 	char *remote_host = 0;
 	int detach = 0;
 	int lflag = 0;
+	time_t next_report = 0;
 
 	if (getuid() != 0) {
 		// because we need access to raw Ethernet packets on a given
@@ -362,9 +446,9 @@ main(int argc, char *argv[]) {
 		port = ARGF();
 		break;
 	case 'r':
-		report_time = now() + REPORT_INTERVAL;
+		report_time = atoi(ARGF());
 		break;
-	case 's':
+	case 'e':
 		use_syslog = 0;
 		break;
 	case '4':
@@ -438,6 +522,9 @@ main(int argc, char *argv[]) {
 			return 12;
 	}
 
+	if (report_time)
+		next_report = now() + report_time*60;
+
 	pcap_fd = init_pcap(dev);
 	if (pcap_fd < 0)
 		return 12;
@@ -470,33 +557,48 @@ main(int argc, char *argv[]) {
 				break;
 			Log(LOG_ERR, "select error: %s, %d, aborting",
 				strerror(errno), errno);
-			return 20;;
+			return 20;
 		}
 
 		if (FD_ISSET(pcap_fd, &fds)) {		// incoming local packet
 			pkt = get_local_packet();
-			if (!pkt)
+			if (unwanted_packet(pkt))
 				continue;
-
+			Log(LOG_DEBUG, "local:    %s", pkt_str(pkt));
+			local_packets_sniffed++;
+			local_bytes_sniffed += pkt->len;
 			// see if we are sniffing our own bridged traffic
-			if (known_remote_eaddr(ETHER(pkt)->ether_shost))
+			if (known_remote_eaddr(ETHER(pkt)->ether_shost)) {
+				loopback_packets_ignored++;
+				Log(LOG_DEBUG, "local:    %s loopback", pkt_str(pkt));
 				continue;
+			}
 
 			// if destination is known to be local, don't forward
-			if (known_local_eaddr(ETHER(pkt)->ether_dhost))
+			if (known_local_eaddr(ETHER(pkt)->ether_dhost)) {
+				local_packets_not_needing_tunnel++;
+				Log(LOG_DEBUG, "local:    %s opt", pkt_str(pkt));
 				continue;
-			add_local_eaddr(ETHER(pkt)->ether_shost); // remember local src
-			if (IS_EBCAST(ETHER(pkt)->ether_dhost)) {
-				send_packet_to_remote(pkt);
 			}
+			add_local_eaddr(ETHER(pkt)->ether_shost); // remember local src
+//			if (IS_EBCAST(ETHER(pkt)->ether_dhost)) {
+				outgoing_tunnel_packets++;
+				outgoing_tunnel_bytes += pkt->len;
+				Log(LOG_INFO, " >tunnel: %s", tunnel_str(pkt));
+				send_packet_to_remote(pkt);
+//			}
 			busy = 1;
 		}
 		if (FD_ISSET(tfd, &fds)) { 	// remote from the tunnel
 			pkt = read_tunneled_packet();
 			if (!pkt)
 				continue;
+			incoming_tunnel_packets++;
+			incoming_tunnel_bytes += pkt->len;
+			Log(LOG_INFO, " <tunnel: %s", tunnel_str(pkt));
 			if (IS_PROTO(pkt)) {
-				int proto = *(int *)pkt->data;
+				incoming_proto_packets++;
+				int proto = PROTO(pkt);
 				switch (proto) {
 				case Phello:
 					Log(LOG_INFO, "Remote started tunnel session");
@@ -521,12 +623,12 @@ main(int argc, char *argv[]) {
 			}
 			busy = 1;
 		}
+		if (report_time && now() >= next_report) {
+			do_report();
+			next_report = now() + report_time*60;
+		}
 		if (!busy) {
-			time_t t = now();
-			if (report_time && t > report_time) {
-				do_report();
-				report_time = t + REPORT_INTERVAL;
-			}
+			not_busy++;
 			send_proto(Pheartbeat);
 			Log(LOG_DEBUG, "timeout");
 			usleep(500);	// microseconds
