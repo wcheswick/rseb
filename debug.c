@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 #include <sys/types.h>
 #include <arpa/inet.h>
@@ -9,6 +10,8 @@
 #include <sys/socket.h>
 #include <net/if_arp.h>
 #include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
 #include <netinet/in.h>
 #include <netdb.h>
 
@@ -45,6 +48,22 @@ const struct {
     { ETHERTYPE_LOOPBACK,       "Loopback" },
     { 0, NULL}
 };
+
+char *
+proto_str(packet_proto pp) {
+	switch (pp) {
+	case Phello:
+		return "Hello";
+	case Phelloback:
+		return "Hello reply";
+	case Pheartbeat:
+		return "Heartbeat";
+	case Pbye:
+		return "Bye";
+	default: 
+		return "Unknown";
+	}
+}
 
 #define ESTRLEN	(ETHER_ADDR_LEN*3)
 
@@ -94,83 +113,105 @@ e_hdr_str(struct ether_header *hdr) {
 char *
 hex(u_char *b) {
 	static char buf[100];
-	snprintf(buf, sizeof(buf), "%.02x %.02x %.02x %.02x  %.02x %.02x %.02x %.02x  %.02x %.02x %.02x %.02x  %.02x %.02x %.02x %.02x",
+	snprintf(buf, sizeof(buf), "%.02x %.02x %.02x %.02x  %.02x %.02x %.02x %.02x  %.02x %.02x %.02x %.02x  %.02x %.02x %.02x %.02x  %.02x %.02x %.02x %.02x  %.02x %.02x %.02x %.02x",
 		b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-		b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+		b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+		b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]);
 	return buf;
 }
 
 char *
-edump(struct ether_header *hdr) {
+pkt_dump_str(packet *p) {
+	struct ether_header *hdr = (struct ether_header *)p->data;
 	static char buf[1000];
-	char buf2[100];
+	char buf2[1000];
 	char *dbuf = "";
 	u_short type = ntohs(hdr->ether_type);
 
 	switch (type) {
 	case ETHERTYPE_ARP: {
-		struct arphdr *ahdr = (struct arphdr *)(hdr + sizeof(struct ether_header));
+		struct arphdr *ahdr = (struct arphdr *)((u_char *)hdr + sizeof(struct ether_header));
+		struct in_addr *sa = (struct in_addr *)ar_spa(ahdr);
+		struct in_addr *ta = (struct in_addr *)ar_tpa(ahdr);
+		char src[100], tgt[100];
+
+		strncpy(src, inet_ntoa(*sa), sizeof(src));
+		strncpy(tgt, inet_ntoa(*ta), sizeof(tgt));
+
 		u_short arp_code = ntohs(ahdr->ar_op);
 		switch (arp_code) {
 		case ARPOP_REQUEST:
-			dbuf =" request";
+			snprintf(buf2, sizeof(buf2), " request who-has %s tell %s",
+				tgt, src);
+			dbuf = buf2;
 			break;
 		case ARPOP_REPLY:
-			dbuf =" reply";
+			ether_print((u_char *)ar_tha(ahdr), tgt);
+			snprintf(buf2, sizeof(buf2), " reply %s is-at %s",
+				src, tgt);
+			dbuf = buf2;
+			dbuf = buf2;
 			break;
 		default:
-			snprintf(buf2, sizeof(buf2), " %s", hex(&((u_char *)hdr)[12]));
-
-//			snprintf(buf2, sizeof(buf2), " code %d", arp_code);
+			snprintf(buf2, sizeof(buf2), "  %p+%lu = %p   %s",
+				(void *)hdr, (u_long)sizeof(struct ether_header),
+				(void *)ahdr,
+				hex((u_char *)hdr));
+#ifdef notdef
+			snprintf(buf2, sizeof(buf2), "  %.04x %.04x %02x %02x %.04x",
+				ahdr->ar_hrd, ahdr->ar_pro, ahdr->ar_hln,
+				ahdr->ar_pln, ahdr->ar_op);
+			snprintf(buf2, sizeof(buf2), " code %d", arp_code);
+#endif
 			dbuf = buf2;
 		}
 		break;
 	}
-	case ETHERTYPE_IP:
+	case ETHERTYPE_IP: {
+		struct ip *ip = (struct ip *)((u_char *)hdr + sizeof(struct ether_header));
+		char src[100], dst[100];
+		u_short src_port, dst_port;
+		char *proto;
+
+		strncpy(src, inet_ntoa(ip->ip_src), sizeof(src));
+		strncpy(dst, inet_ntoa(ip->ip_dst), sizeof(dst));
+		switch (ip->ip_p) {
+		case IPPROTO_TCP: {
+			struct tcphdr *tcph = (struct tcphdr *)((u_char *)ip + sizeof(struct ip));
+			proto = "TCP";
+			src_port = tcph->th_sport;
+			dst_port = tcph->th_dport;
+			break;
+		}
+		case IPPROTO_UDP: {
+			struct udphdr *udph = (struct udphdr *)((u_char *)ip + sizeof(struct ip));
+			proto = "UDP";
+			src_port = udph->uh_sport;
+			dst_port = udph->uh_dport;
+			break;
+		}
+			break;
+		default: {
+			static char buf3[100];
+			snprintf(buf3, sizeof(buf3), "IP proto %d", ip->ip_p);
+			proto = buf3;
+		}
+		}
+
+		snprintf(buf2, sizeof(buf2), "  %s %s:%hu -> %s:%hu",
+			proto, src, ntohs(src_port),
+			dst, ntohs(dst_port));
+		dbuf = buf2;
 		break;
-	case ETHERTYPE_IPV6:
+	}
+	case ETHERTYPE_IPV6: {
 		break;
+	}
 	default:
 		dbuf = "?";
 	}
 	snprintf(buf, sizeof(buf), "%s%s", e_hdr_str(hdr), dbuf);
 	return buf;
-}
-
-#ifdef old
-void
-dump_ether_header(struct ether_header *hdr) {
-	char src[ESTRLEN];
-	char dst[ESTRLEN];
-	
-	ether_print(hdr->ether_shost, src);
-	ether_print(hdr->ether_dhost, dst);
-	fprintf(stderr, "%s > %s  %s", src, dst, e_type_str(hdr->ether_type));
-}
-
-
-#define IP_V(ip)   (((ip)->ip_v & 0xf0) >> 4)		// from tcpdump
-
-void
-dump_ip(packet *pkt) {
-	struct ip *ip = (struct ip *)&(pkt->data);
-	char src[200], dst[200];
-	int family, src_port, dst_port;
-
-	Log(LOG_DEBUG, "IPv%d packet, len = %d", ip->ip_v, pkt->len);
-
-}
-packet *pkt
-#endif
-
-char *
-pkt_str(packet *p) {
-//	struct ether_header *hdr = (struct ether_header *)p->data;
-//	char *ehdr = e_hdr_str(hdr);
-
-	if (IS_PROTO(p))
-		return "(protocol)";
-	return hex((void *)p->data);
 }
 
 char *
@@ -198,6 +239,7 @@ sa_str(struct sockaddr *sa) {
 		port = 0;
 		snprintf(buf, sizeof(buf), "dump_sa: unknown family: %d", sa->sa_family);
 	}
-	snprintf(obuf, sizeof(obuf), "%s:%d", buf, port);
+	snprintf(obuf, sizeof(obuf), "%s port %d", buf, port);
 	return obuf;
 }
+

@@ -35,17 +35,18 @@ extern	u_char ether_bcast[ETHER_ADDR_LEN];
 
 /* debug.c */
 extern	char *e_hdr_str(struct ether_header *hdr);
-extern	char *edump(struct ether_header *hdr);
+extern	char *pkt_dump_str(packet *p);
 extern	void ether_print(u_char *eaddr, char *buf);
 extern	char *sa_str(struct sockaddr *sa);
 extern	char *pkt_str(packet *p);
+extern	char *proto_str(packet_proto pp);
 
 /* db.c */
 extern	void init_db(void);
 extern	int known_local_eaddr(u_char addr[ETHER_ADDR_LEN]);
 extern	int known_remote_eaddr(u_char addr[ETHER_ADDR_LEN]);
-extern	void add_local_eaddr(u_char new[ETHER_ADDR_LEN]);
-extern	void add_remote_eaddr(u_char new[ETHER_ADDR_LEN]);
+extern	void eaddr_is_local(u_char new[ETHER_ADDR_LEN]);
+extern	void eaddr_is_remote(u_char new[ETHER_ADDR_LEN]);
 
 extern	char *ether_addr(u_char *eaddr);
 extern	char *hex(u_char *b);

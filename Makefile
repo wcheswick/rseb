@@ -2,6 +2,8 @@ LOCAL_SBIN=/usr/local/sbin
 LOCAL_MAN=/usr/local/man/man8
 LOCAL_RC=/usr/local/etc/rc.d
 
+REMOTE=garage-tunnel
+
 CFLAGS+=-g -static -Wall -pedantic -Wno-comment -O0
 
 OBJS=main.o debug.o db.o util.o # proto.o
@@ -25,8 +27,9 @@ ${LOCAL_MAN}/rseb.8:	rseb.8
 ${LOCAL_RC}/rseb:	rseb.rc
 	sudo install -m 0755 -o root -g wheel rseb.rc ${LOCAL_RC}/rseb
 	@echo
-	@echo "On the server, add to /etc/rc.conf:"
+	@echo "On the client, add to /etc/rc.conf:"
 	@echo 'rseb_enable="YES"'
+	@echo 'rseb_flags="[-6] <client-address>"'
 	@echo
 
 clean::
@@ -35,7 +38,7 @@ clean::
 
 test::	rseb
 #	sudo ./rseb -d -d -D
-	sudo ./rseb -d -d -s tunnel-garage.local	# client test
+	sudo ./rseb -d -d -r -D -s garage-tunnel	# client test
 
 #	sudo ./rseb -d -d fd72:6574:6e65:7466::20
 #	sudo ./rseb -d		# discover interface
@@ -45,12 +48,12 @@ test::	rseb
 #	-sudo ./rseb -d - localhost 67000
 
 push::
-	rsync -a ../rseb/*.[hc] ../rseb/Makefile ../rseb/rseb.rc garage:src/rseb
-	ssh garage "cd src/rseb; make clean install"
+	rsync -a ../rseb/*.[hc] ../rseb/Makefile ../rseb/rseb.rc ${REMOTE}:src/rseb
+	ssh ${REMOTE} "cd src/rseb; make clean install"
 
 pushtest:	test
 	rsync -a ../rseb/*.[hc] garage:src/rseb
 	ssh garage "cd src/rseb; make clean test"
 
 servertest::
-	/usr/local/sbin/rseb -d -s -l
+	rseb  -d -d -l -s -6

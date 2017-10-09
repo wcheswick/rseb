@@ -31,17 +31,22 @@
 #include <linux/sockios.h>
 #endif
 
-
 #include "rseb.h"
 #include "arg.h"
 
 #define RSEB_PORT	"1127"
-#define REPORT_INTERVAL	(60*60)	// in seconds
+#define REPORT_INTERVAL	10	// (60*60)	// in seconds
+
+
+//	debug > 2	show all packet decisions
+//	debug > 1	show packet decisions not involving known local traffic
+//	debug == 1	misc debug
 
 int debug = 0;
 int use_syslog = 1;
 
 int report_time = 0;
+int connected = 0;	// If we have seen at least one protocol packet
 
 int tfd = -1;		// for the tunnel to the remote
 int pcap_fd = -1;	// from the local interface
@@ -53,34 +58,87 @@ sa_family_t family = AF_UNSPEC;	// AF_INET or AF_INET6
 pcap_t *pcap_handle;
 char pcap_err_buf[PCAP_ERRBUF_SIZE];
 
-#define PCAP_FILTER	"arp"
+#define PCAP_FILTER	"arp or broadcast"
 
 #define	SYSLOG_SERVICE	LOG_LOCAL1
-
 
 
 // return an fd for the pcap device if all is ok
 
 int
 init_pcap(char *dev) {
+#ifdef brokenfilter
 	struct bpf_program fp;
-	int fd;
+#endif
+	int fd, rc;
 
-	pcap_handle = pcap_open_live(dev, BUFSIZ, 1, 1, pcap_err_buf);
-	if (pcap_handle == NULL) {
-		Log(LOG_ERR, "could not open interface '%s': %s",
+	pcap_handle = pcap_create(dev, pcap_err_buf);
+	if (!pcap_handle) {
+		Log(LOG_ERR, "pcap_create: could not start pcap, interface '%s': %s",
 			dev, pcap_err_buf);
 		return -1;
 	}
-	if (pcap_setnonblock(pcap_handle, 1, pcap_err_buf) < 0) {
-		Log(LOG_ERR, "ipcap_setnonblock failed: %s", pcap_err_buf);
+#ifdef notdef
+	if (!pcap_setdirection(pcap_handle, PCAP_D_INOUT)) {	// want PCAP_D_IN?
+		Log(LOG_ERR, "pcap_setdirection: pcap cannot set capture direction: %s", 
+			pcap_geterr(pcap_handle));
 		return -1;
 	}
-	if (pcap_datalink(pcap_handle) != DLT_EN10MB) {
-		Log(LOG_ERR, "interface '%s' not supported", dev);
+#endif
+
+	rc = pcap_activate(pcap_handle);
+	if (rc > 0) {		// pcap warning
+		switch (rc) {
+		case PCAP_WARNING_PROMISC_NOTSUP:
+			Log(LOG_ERR, "pcap_activate: pcap promiscous unsupported");
+			return -1;
+		case PCAP_WARNING_TSTAMP_TYPE_NOTSUP:
+			Log(LOG_ERR, "pcap_activate: time stamp type unsupported");
+			break;
+		case PCAP_WARNING:
+			Log(LOG_ERR, "pcap_activate warning: %s",
+				pcap_geterr(pcap_handle));
+			break;
+		default:
+ 			Log(LOG_ERR, "pcap_activate unknown warning");
+		}
+	} else if (rc < 0) {	// pcap error
+		Log(LOG_ERR, "pcap_activate error %d: %s", 
+			rc, pcap_geterr(pcap_handle));
 		return -1;
 	}
 
+	if (!pcap_set_timeout(pcap_handle, 1)) {
+		Log(LOG_ERR, "pcap_set_timeout: cannot set timeout: %s", 
+			pcap_geterr(pcap_handle));
+		return -1;
+	}
+	if (!pcap_set_snaplen(pcap_handle, 2000)) {
+		Log(LOG_ERR, "pcap cannot set snap length: %s", 
+			pcap_geterr(pcap_handle));
+		return -1;
+	}
+	if (!pcap_set_promisc(pcap_handle, 1)) {
+		Log(LOG_ERR, "pcap_set_promisc: pcap cannot set promiscuous mode: %s", 
+			pcap_geterr(pcap_handle));
+		return -1;
+	}
+
+	if (pcap_setnonblock(pcap_handle, 1, pcap_err_buf) < 0) {
+		Log(LOG_ERR, "pcap_setnonblock failed: %s", pcap_geterr(pcap_handle));
+		return -1;
+	}
+	if (pcap_datalink(pcap_handle) != DLT_EN10MB) {
+		Log(LOG_ERR, "pcap_datalink: interface '%s' not supported", dev);
+		return -1;
+	}
+	if (!pcap_set_buffer_size(pcap_handle, 100000)) {
+		Log(LOG_ERR, "pcap_set_buffer_size: cannot set buffer size: %s", 
+			pcap_geterr(pcap_handle));
+		return -1;
+	}
+
+#ifdef brokenfilter
 	if (pcap_compile(pcap_handle, &fp, PCAP_FILTER, 0, 0) < 0) {
 		Log(LOG_ERR, "bad filter: '%s', %s", 
 			PCAP_FILTER, pcap_geterr(pcap_handle));
@@ -91,10 +149,11 @@ init_pcap(char *dev) {
 			PCAP_FILTER, pcap_geterr(pcap_handle));
 		return -1;
 	}
+#endif
 
 	fd = pcap_get_selectable_fd(pcap_handle);
 	if (fd < 0) {
-		Log(LOG_ERR, "pcap device unsuitable for select '%s'", 
+		Log(LOG_ERR, "pcap_get_selectable_fd: device unsuitable for select '%s'", 
 			dev);
 		return -1;
 	}
@@ -125,7 +184,8 @@ bind_local_udp(int s, char *port_name) {
 	if (bind(s, (struct sockaddr *)tunnel_local_ai->ai_addr,
 	    tunnel_local_ai->ai_addrlen) < 0) {
 		Log(LOG_ERR, "listener bind to %s failed: %s",
-		        sa_str((struct sockaddr *)tunnel_local_ai->ai_addr), strerror(errno));
+		        sa_str((struct sockaddr *)tunnel_local_ai->ai_addr),
+			strerror(errno));
 		return -1;
 	}
 	return 0;
@@ -158,8 +218,6 @@ create_udp_tunnel_server_listener(char *port_name) {
 	if (bind_local_udp(s, port_name) < 0) {
 		return -1;
 	}
-
-	Log(LOG_DEBUG, "listener started");
 	return s;
 }
 
@@ -182,7 +240,8 @@ create_udp_tunnel_to_server(char *host_name, char *port_name) {
         hints.ai_protocol = IPPROTO_UDP;
         rc = getaddrinfo(host_name, port_name, &hints, &tunnel_ai);
         if (rc) {
-                Log(LOG_ERR, "getaddress failure:%s", gai_strerror(rc));
+                Log(LOG_ERR, "getaddress failure to '%s', %s", 
+		    host_name, gai_strerror(rc));
                 return -1;
         }
 
@@ -196,6 +255,8 @@ create_udp_tunnel_to_server(char *host_name, char *port_name) {
                 Log(LOG_ERR, "tunnel socket failed, %d, %p", s, tunnel_res);
                 return -1;
         }
+	Log(LOG_WARNING, "family desired: %d, got %d",
+	    family, tunnel_res->ai_family);
         if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
                 Log(LOG_ERR, "tunnel setsockopt failed, %s", strerror(errno));
                 return -1;
@@ -204,7 +265,7 @@ create_udp_tunnel_to_server(char *host_name, char *port_name) {
 		return -1;
 
 	remote_tunnel_sa_size = tunnel_res->ai_addrlen;
-	remote_tunnel_sa = (struct sockaddr *)malloc(remote_tunnel_sa_size);
+	remote_tunnel_sa = (struct sockaddr *)malloc(sizeof(struct sockaddr_storage));
 	memcpy(remote_tunnel_sa, tunnel_res->ai_addr, remote_tunnel_sa_size);
 
 	free(tunnel_res);
@@ -215,7 +276,6 @@ packet *
 get_local_packet(void) {
 	struct pcap_pkthdr *phdr;
 	static packet p;
-	struct ether_header *ehdr;
 	int rc = pcap_next_ex(pcap_handle, &phdr, &p.data);
 	switch (rc) {
 	case 0:		// timeout
@@ -228,10 +288,9 @@ get_local_packet(void) {
 		return 0;
 	}
 
-	ehdr = (struct ether_header *)p.data;
-	Log(LOG_DEBUG, "  local: %s", edump(ehdr));
 	if (phdr->caplen != phdr->len) {
-		Log(LOG_WARNING, "short packet, %d != %d", phdr->caplen != phdr->len);
+		Log(LOG_WARNING, "short packet, %d != %d",
+			phdr->caplen != phdr->len);
 	}
 	p.len = phdr->caplen;
 	return &p;
@@ -253,14 +312,16 @@ send_packet_to_remote(packet *pkt) {
 	n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, 
 		remote_tunnel_sa, remote_tunnel_sa_size);
 	if (n < 0) {
-		Log(LOG_WARNING, "packet transmit error %s", strerror(errno));
+		Log(LOG_WARNING, "packet transmit error: (%d) %s",
+			errno, strerror(errno));
+		Log(LOG_WARNING, "tfd=%d len=%d sa=%s",
+			tfd, pkt->len, sa_str(remote_tunnel_sa));
+exit(13);
 		return;
 	}
 	if (n != pkt->len)
 		Log(LOG_WARNING, "send_packet_to_remote: short packet: %d %d",
 			n, pkt->len);
-	if (remote_tunnel_sa)
-		Log(LOG_DEBUG, "L >>>>>  %s", pkt_str(pkt));;
 }
 
 void
@@ -269,16 +330,21 @@ send_proto(int proto_msg) {
 	p.data = (void *)&proto_msg;
 	p.len = sizeof(proto_msg);
 	send_packet_to_remote(&p);
+	if (debug > 1) {
+		Log(LOG_WARNING, ">TUN  protocol %s", proto_str(proto_msg));
+	}
 }
 
 packet *
 read_tunneled_packet(void) {
-	struct sockaddr from_sa;
+	struct sockaddr_storage from_sa;
 	socklen_t from_sa_size = sizeof(from_sa);
 	static u_char buf[1500];
 	static packet p;
 
-	p.len = recvfrom(tfd, buf, sizeof(buf), 0, &from_sa, &from_sa_size);
+
+	p.len = recvfrom(tfd, buf, sizeof(buf), 0, 
+		(struct sockaddr *)&from_sa, &from_sa_size);
 	p.data = (const u_char *)&buf;
 	if (!remote_tunnel_sa) {
 		// This is the first connection to this server.  We save
@@ -286,14 +352,13 @@ read_tunneled_packet(void) {
 		// conversation.  XX we should comment if someone else
 		// doesn't butt in, at least without comment.
 
-		Log(LOG_INFO, "Tunnel established from %s", sa_str(&from_sa));
+		Log(LOG_INFO, "Tunnel established from (%d) %s",
+			from_sa_size, sa_str((struct sockaddr *)&from_sa));
 		warned = 0;
 		remote_tunnel_sa_size = from_sa_size;
-		remote_tunnel_sa = (struct sockaddr *)malloc(remote_tunnel_sa_size);
+		remote_tunnel_sa = (struct sockaddr *)malloc(sizeof(struct sockaddr_storage));
 		memcpy(remote_tunnel_sa, &from_sa, remote_tunnel_sa_size);
 	}
-	Log(LOG_DEBUG, "L <<<<<  %s", pkt_str(&p)); //sa_str(remote_tunnel_sa));
-
 	return &p;
 }
 
@@ -318,6 +383,7 @@ void
 interrupt(int i) {
 	Log(LOG_DEBUG, "interrupt %d, terminating", i);
 	send_proto(Pbye);
+	do_report();
 }
 
 int
@@ -331,7 +397,7 @@ main(int argc, char *argv[]) {
 	char *dev = 0;
 	char *port = RSEB_PORT;
 	char *remote_host = 0;
-	int detach = 0;
+	int detach = -1;	// default, client detaches, server doesn't
 	int lflag = 0;
 
 	if (getuid() != 0) {
@@ -350,7 +416,7 @@ main(int argc, char *argv[]) {
 		debug++;
 		break;
 	case 'D':
-		detach = 1;
+		detach = 0;
 		break;
 	case 'i':
 		dev = ARGF();
@@ -401,6 +467,11 @@ main(int argc, char *argv[]) {
 		}
 	}
 
+	// By default, the client detaches (called at startup) and 
+	// server does not (called by inetd)
+
+	if (detach < 0)
+		detach = is_server ? 0 : 1;
 	if (detach) {
 		use_syslog = 1;
 		switch (fork()) {
@@ -431,7 +502,7 @@ main(int argc, char *argv[]) {
 			if (strchr(remote_host, ':'))
 				family = AF_INET6;
 			else
-				family = AF_INET;
+				family = AF_UNSPEC;
 		}
 		tfd = create_udp_tunnel_to_server(remote_host, port);
 		if (tfd < 0)
@@ -440,15 +511,16 @@ main(int argc, char *argv[]) {
 
 	pcap_fd = init_pcap(dev);
 	if (pcap_fd < 0)
-		return 12;
+		return 13;
 
 	signal(SIGINT, interrupt);
 	signal(SIGHUP, interrupt);
 
 	if (is_server) {
-		Log(LOG_INFO, "Server bridging interface %s", dev);
+		Log(LOG_NOTICE, "Server bridging interface %s", dev);
 	} else {
-		Log(LOG_INFO, "Bridging interface %s", dev);
+		Log(LOG_INFO, "Client bridging interface %s to %s",
+		    dev, remote_host);
 		send_proto(Phello);
 	}
 
@@ -462,7 +534,7 @@ main(int argc, char *argv[]) {
 		FD_SET(pcap_fd, &fds);
 		FD_SET(tfd, &fds);
 
-		timeout.tv_sec = 10;	// seconds CHECKTIME;
+		timeout.tv_sec = connected ? 20 : 3;	// seconds CHECKTIME;
 		timeout.tv_usec = 0;
 		n = select(10, &fds, 0, 0, &timeout);
 		if (n < 0) {
@@ -470,23 +542,50 @@ main(int argc, char *argv[]) {
 				break;
 			Log(LOG_ERR, "select error: %s, %d, aborting",
 				strerror(errno), errno);
-			return 20;;
+			return 20;
 		}
 
 		if (FD_ISSET(pcap_fd, &fds)) {		// incoming local packet
 			pkt = get_local_packet();
 			if (!pkt)
 				continue;
-
-			// see if we are sniffing our own bridged traffic
-			if (known_remote_eaddr(ETHER(pkt)->ether_shost))
+			if (!connected) {
+				if (debug > 2) {
+					Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
+					Log(LOG_DEBUG, "  DNF: not connected");
+				}
 				continue;
+			}
+
+#ifdef notdef
+			// see if we are sniffing our own bridged traffic
+			if (known_remote_eaddr(ETHER(pkt)->ether_shost)) {
+				if (debug > 1)
+					Log(LOG_DEBUG, "  DNF: Own bridged traffic");
+				continue;
+			}
+#endif
+
+			eaddr_is_local(ETHER(pkt)->ether_shost); // remember local src
 
 			// if destination is known to be local, don't forward
-			if (known_local_eaddr(ETHER(pkt)->ether_dhost))
+			if (known_local_eaddr(ETHER(pkt)->ether_dhost)) {
+				if (debug > 2) {
+					Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
+					Log(LOG_DEBUG, "  DNF: local dest");
+				}
 				continue;
-			add_local_eaddr(ETHER(pkt)->ether_shost); // remember local src
+			}
+			if (debug > 1)
+				Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
+
 			if (IS_EBCAST(ETHER(pkt)->ether_dhost)) {
+				if (debug > 1)
+					Log(LOG_DEBUG, "  >TUN  dest is broadcast");
+				send_packet_to_remote(pkt);
+			} else {
+				if (debug > 1)
+					Log(LOG_DEBUG, "  >TUN  src/dst locations unknown");
 				send_packet_to_remote(pkt);
 			}
 			busy = 1;
@@ -497,39 +596,60 @@ main(int argc, char *argv[]) {
 				continue;
 			if (IS_PROTO(pkt)) {
 				int proto = *(int *)pkt->data;
+
+				if (debug > 1) {
+					Log(LOG_DEBUG, "<TUN  proto %s", proto_str(proto));
+				}
+
 				switch (proto) {
 				case Phello:
 					Log(LOG_INFO, "Remote started tunnel session");
 					send_proto(Phelloback);
+					connected = 1;
 					break;
 				case Phelloback:
 					Log(LOG_INFO, "Remote end is alive");
+					connected = 1;
 					break;
 				case Pheartbeat:
 					// Log(LOG_INFO, "Lubdub");
+					connected = 1;
 					break;
 				case Pbye:
 					Log(LOG_INFO, "Session terminated by other end");
+					do_report();
 					return 0;
 				default:
 					Log(LOG_WARNING, "Unexpected protocol: %d",
 						proto);
 				}
-			} else {
-				add_remote_eaddr(ETHER(pkt)->ether_shost);
+			} else if (connected) {
+				if (debug > 1) {
+					Log(LOG_DEBUG, "<TUN  %s",  pkt_dump_str(pkt));
+					Log(LOG_DEBUG, "  >LOC");
+				}
+				eaddr_is_remote(ETHER(pkt)->ether_shost);
 				inject_packet_from_remote(pkt);
+			} else {
+				if (debug > 1)
+					Log(LOG_DEBUG, "  not connected, ignored");
 			}
 			busy = 1;
 		}
 		if (!busy) {
+			if (!connected)
+				send_proto(Phello);
+			else
+				send_proto(Pheartbeat);
+			usleep(500);	// microseconds
+		}
+		if (report_time) {
 			time_t t = now();
-			if (report_time && t > report_time) {
+			if (t > report_time) {
 				do_report();
+// exit(13);
 				report_time = t + REPORT_INTERVAL;
 			}
-			send_proto(Pheartbeat);
-			Log(LOG_DEBUG, "timeout");
-			usleep(500);	// microseconds
 		}
 	}
 
