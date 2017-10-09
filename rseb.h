@@ -2,16 +2,19 @@
 
 #include <sys/socket.h>
 #include <syslog.h>
+#include <net/ethernet.h>
+#include <net/if.h>
 
 typedef enum packet_proto {
 	Phello,
 	Phelloback,
-	Pheartbeat = 0x01111111,
+	Pheartbeat,
 	Pbye,
 } packet_proto;
 
 #define PROTO_SIZE	sizeof(packet_proto)
 #define IS_PROTO(p)	((p)->len == PROTO_SIZE)
+#define PROTO(pkt)	(*(int *)(pkt)->data)
 
 typedef struct packet {
 	ssize_t len;
@@ -53,4 +56,9 @@ extern	char *hex(u_char *b);
 extern	void dump_local_eaddrs(void);
 extern	void dump_remote_eaddrs(void);
 
-/* proto.c */
+/* localio.c */
+extern	char *local_dev(void);
+extern	int init_capio(char *dev);
+extern	packet *get_local_packet(void);
+extern	void put_local_packet(packet *pkt);
+

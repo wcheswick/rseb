@@ -132,7 +132,7 @@ dump_local_eaddrs(void) {
 	
 	Log(LOG_DEBUG, "Local MACs:");
 	SPLAY_FOREACH(e, ethernet_tree, &local_eaddrs) {
-		Log(LOG_DEBUG, "%s %7d  %5d",
+		Log(LOG_INFO, "%s %7d  %5d",
 			ether_addr(e->addr), e->count, t - e->last_seen);
 	}
 	Log(LOG_DEBUG, "-----------");
@@ -148,7 +148,7 @@ dump_remote_eaddrs(void) {
 	
 	Log(LOG_DEBUG, "Remote MACs:");
 	SPLAY_FOREACH(e, ethernet_tree, &remote_eaddrs) {
-		Log(LOG_DEBUG, "%s %7d  %5d",
+		Log(LOG_INFO, "%s %7d  %5d",
 			ether_addr(e->addr), e->count, t - e->last_seen);
 	}
 	Log(LOG_DEBUG, "-----------");

@@ -5,13 +5,13 @@ LOCAL_RC=/usr/local/etc/rc.d
 REMOTE=garage-tunnel
 
 CFLAGS+=-g -static -Wall -pedantic -Wno-comment -O0
-
-OBJS=main.o debug.o db.o util.o # proto.o
+DFLAGS+=  #   -lpcap
+OBJS=main.o debug.o db.o util.o bpfcapio.o  # pcapio.o rawcapio.o 
 
 all::	rseb
 
 rseb:	${OBJS}
-	${CC} ${CFLAGS} ${OBJS} -lpcap -o rseb
+	${CC} ${CFLAGS} ${OBJS} ${DFLAGS} -o rseb
 
 main.o debug.o:	rseb.h
 
@@ -38,7 +38,7 @@ clean::
 
 test::	rseb
 #	sudo ./rseb -d -d -D
-	sudo ./rseb -d -d -r -D -s garage-tunnel	# client test
+	sudo ./rseb -d -d -d -r -D -s garage-tunnel	# client test
 
 #	sudo ./rseb -d -d fd72:6574:6e65:7466::20
 #	sudo ./rseb -d		# discover interface
