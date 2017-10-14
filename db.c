@@ -14,7 +14,7 @@ int db_debug = 0;	// internal database debugging
 
 typedef struct ethernet_entry {
 	SPLAY_ENTRY(ethernet_entry) next;
-	u_char addr[ETHER_ADDR_LEN];
+	struct ether_addr  addr;
 	time_t last_seen;
 	long	count;
 } ethernet_entry;
@@ -23,7 +23,8 @@ SPLAY_HEAD(ethernet_tree, ethernet_entry) local_eaddrs, remote_eaddrs;
 
 int
 ethernet_compare(ethernet_entry *a, ethernet_entry *b) {
-	return memcmp((ethernet_entry *)a->addr, (ethernet_entry *)b->addr, ETHER_ADDR_LEN);
+	return memcmp((ethernet_entry *)&a->addr, (ethernet_entry *)&b->addr,
+		sizeof(struct ether_addr));
 }
 
 SPLAY_PROTOTYPE(ethernet_tree, ethernet_entry, next, ethernet_compare)
@@ -36,13 +37,13 @@ init_db(void) {
 }
 
 static void
-verify_entry(u_char eaddr[ETHER_ADDR_LEN], struct ethernet_tree *root) {
+verify_entry(struct ether_addr *eaddr, struct ethernet_tree *root) {
 	struct ethernet_entry find, *e;
 
 //	if (IS_EBCAST(new))
 //		return;
 
-	memcpy(find.addr, eaddr, sizeof(find.addr));
+	memcpy(&find.addr, eaddr, sizeof(find.addr));
 	e = SPLAY_FIND(ethernet_tree, root, &find);
 	if (e) {
 		if (db_debug)
@@ -57,14 +58,14 @@ verify_entry(u_char eaddr[ETHER_ADDR_LEN], struct ethernet_tree *root) {
 	e = (struct ethernet_entry *)malloc(sizeof(struct ethernet_entry));
 	assert(e);
 	memset(e, 0, sizeof(struct ethernet_entry));
-	memcpy(e->addr, eaddr, sizeof(e->addr));
+	memcpy(&e->addr, eaddr, sizeof(e->addr));
 	e->count = 1;
 	e->last_seen = now();
 	SPLAY_INSERT(ethernet_tree, root, e);
 }
 
 void
-eaddr_is_remote(u_char eaddr[ETHER_ADDR_LEN]) {
+eaddr_is_remote(struct ether_addr *eaddr) {
 	if (db_debug)
 		Log(LOG_DEBUG," rem key %s", ether_addr(eaddr));
 	if (IS_EBCAST(eaddr))
@@ -73,7 +74,7 @@ eaddr_is_remote(u_char eaddr[ETHER_ADDR_LEN]) {
 }
 
 void
-eaddr_is_local(u_char eaddr[ETHER_ADDR_LEN]) {
+eaddr_is_local(struct ether_addr *eaddr) {
 	if (db_debug)
 		Log(LOG_DEBUG," loc key %s", ether_addr(eaddr));
 	if (IS_EBCAST(eaddr))
@@ -82,9 +83,9 @@ eaddr_is_local(u_char eaddr[ETHER_ADDR_LEN]) {
 }
 
 static struct ethernet_entry *
-find_entry(u_char addr[ETHER_ADDR_LEN], struct ethernet_tree *root) {
+find_entry(struct ether_addr *addr, struct ethernet_tree *root) {
 	struct ethernet_entry find, *e;
-	memcpy(find.addr, addr, sizeof(find.addr));
+	memcpy(&find.addr, addr, sizeof(find.addr));
 	e = SPLAY_FIND(ethernet_tree, root, &find);
 	if (e) {
 		e->count++;
@@ -95,7 +96,7 @@ find_entry(u_char addr[ETHER_ADDR_LEN], struct ethernet_tree *root) {
 }
 
 int
-known_local_eaddr(u_char addr[ETHER_ADDR_LEN]) {
+known_local_eaddr(struct ether_addr *addr) {
 	int rc;
 
 	if (IS_EBCAST(addr))
@@ -109,7 +110,7 @@ known_local_eaddr(u_char addr[ETHER_ADDR_LEN]) {
 }
 
 int
-known_remote_eaddr(u_char addr[ETHER_ADDR_LEN]) {
+known_remote_eaddr(struct ether_addr *addr) {
 	int rc;
 
 	if (IS_EBCAST(addr))
@@ -133,7 +134,7 @@ dump_local_eaddrs(void) {
 	Log(LOG_DEBUG, "Local MACs:");
 	SPLAY_FOREACH(e, ethernet_tree, &local_eaddrs) {
 		Log(LOG_INFO, "%s %7d  %5d",
-			ether_addr(e->addr), e->count, t - e->last_seen);
+			ether_addr(&e->addr), e->count, t - e->last_seen);
 	}
 	Log(LOG_DEBUG, "-----------");
 }
@@ -149,7 +150,7 @@ dump_remote_eaddrs(void) {
 	Log(LOG_DEBUG, "Remote MACs:");
 	SPLAY_FOREACH(e, ethernet_tree, &remote_eaddrs) {
 		Log(LOG_INFO, "%s %7d  %5d",
-			ether_addr(e->addr), e->count, t - e->last_seen);
+			ether_addr(&e->addr), e->count, t - e->last_seen);
 	}
 	Log(LOG_DEBUG, "-----------");
 }

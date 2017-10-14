@@ -34,13 +34,14 @@
 #include "rseb.h"
 #include "arg.h"
 
-#define RSEB_PORT	"1127"
-#define REPORT_INTERVAL	10	// (60*60)	// in seconds
+#define RSEB_PORT	1127
+#define REPORT_INTERVAL	(60*60) // 10	// (60*60)	// in seconds
 
-
-//	debug > 2	show all packet decisions
-//	debug > 1	show packet decisions not involving known local traffic
-//	debug == 1	misc debug
+//	debug >= 1	misc debug
+//	debug >= 2	all - unconnected - known local - broadcast/multicast
+//	debug >= 3	all - unconnected - known local
+//	debug >= 4	all - unconnected
+//	debug >= 5	all
 
 int debug = 0;
 int use_syslog = 1;
@@ -230,7 +231,6 @@ read_tunneled_packet(void) {
 	static u_char buf[1500];
 	static packet p;
 
-
 	p.len = recvfrom(tfd, buf, sizeof(buf), 0, 
 		(struct sockaddr *)&from_sa, &from_sa_size);
 	p.data = (const u_char *)&buf;
@@ -248,6 +248,83 @@ read_tunneled_packet(void) {
 		memcpy(remote_tunnel_sa, &from_sa, remote_tunnel_sa_size);
 	}
 	return &p;
+}
+
+
+// Tunnel traffic has our UDP port at both ends, and specific ethernet
+// addresses when we learn of them.  Tech debt: this should be done
+// in a filter.
+
+int have_tunnel_endpoints = 0;
+struct ether_addr tunnel_ether_a;
+struct ether_addr tunnel_ether_b;
+
+int
+is_tunnel_traffic(packet *p) {
+	struct ether_header *hdr = (struct ether_header *)p->data;
+	u_short ether_type;
+	int proto;
+	struct udphdr *udph;
+	uint8_t *protohdr;
+
+	if (have_tunnel_endpoints) {
+		if (!memcmp(hdr->ether_shost, &tunnel_ether_a, ETHER_ADDR_LEN) &&
+		    !memcmp(hdr->ether_dhost, &tunnel_ether_a, ETHER_ADDR_LEN))
+			return 0;
+		if (!memcmp(hdr->ether_shost, &tunnel_ether_b, ETHER_ADDR_LEN) &&
+		    !memcmp(hdr->ether_shost, &tunnel_ether_b, ETHER_ADDR_LEN))
+			return 0;
+	}
+
+	// If this sniffed packet is coming from a host known to be remote,
+	// we are probably sniffing a packet we just injected locally.  Ignore it.
+
+	if (known_remote_eaddr((struct ether_addr *)&hdr->ether_shost))
+		return 0;
+
+	ether_type = ntohs(hdr->ether_type);
+	switch (ether_type) {
+	case ETHERTYPE_IP: {
+		struct ip *ip = (struct ip *)((u_char *)hdr +
+			sizeof(struct ether_header));
+		proto = ip->ip_p;
+		protohdr = ((u_char *)ip + sizeof(struct ip));
+		break;
+	}
+	case ETHERTYPE_IPV6: {
+		struct ip6_hdr *ip6 = (struct ip6_hdr *)((u_char *)hdr + 
+			sizeof(struct ether_header));
+		proto = ip6->ip6_nxt;
+		protohdr = ((u_char *)ip6 + sizeof(*ip6));
+		break;
+	}
+	default:
+		return 0;	// can't be a UDP packet
+	}
+
+	if (proto != IPPROTO_UDP)
+		return 0;
+
+	udph = (struct udphdr *)protohdr;
+	if (ntohs(udph->uh_sport) != RSEB_PORT || 
+	    ntohs(udph->uh_dport) != RSEB_PORT)
+		return 0;
+
+	if (!have_tunnel_endpoints) {	// now we do
+		char src[ESTRLEN];
+		char dst[ESTRLEN];
+		
+		memcpy(&tunnel_ether_a, &hdr->ether_shost, ETHER_ADDR_LEN);
+		memcpy(&tunnel_ether_b, &hdr->ether_dhost, ETHER_ADDR_LEN);
+		have_tunnel_endpoints = 1;
+	
+		ether_print((struct ether_addr *)&hdr->ether_shost, src);
+		ether_print((struct ether_addr *)&hdr->ether_dhost, dst);
+		Log(LOG_DEBUG, "Have tunnel info: %s / %s  UDP %hu %hu",
+			src, dst, ntohs(udph->uh_sport), ntohs(udph->uh_dport));
+	}
+
+	return 1;
 }
 
 void
@@ -295,14 +372,15 @@ interrupt(int i) {
 
 int
 usage(void) {
-	fprintf(stderr, "usage: rseb [-d [-d [-d]]] [-D] [-i interface] [-l] [-p port] [-s] [-4|-6] [-r] [remote server ip]\n");
+	fprintf(stderr, "usage: rseb [-d [-d [-d]]] [-D] [-i interface] [-l] [-p port] [-s] [-4|-6] [-r] [remote server ip [port]]\n");
 	return 1;
 }
 
 int
 main(int argc, char *argv[]) {
 	char *dev = 0;
-	char *port = RSEB_PORT;
+	int port = RSEB_PORT;	// XXXX we assume both end are the same
+	char port_name[10];
 	char *remote_host = 0;
 	int detach = -1;	// default, client detaches, server doesn't
 	int lflag = 0;
@@ -333,7 +411,7 @@ main(int argc, char *argv[]) {
 		lflag = 1;	// not inetd, and not detached
 		break;
 	case 'p':
-		port = ARGF();
+		port = atoi(ARGF());
 		break;
 	case 'r':
 		report_time = now() + REPORT_INTERVAL;
@@ -356,7 +434,7 @@ main(int argc, char *argv[]) {
 		is_server = 1;
 		break;
 	case 2:			// client, target host and port
-		port = argv[1];
+		port = atoi(argv[1]);
 		// FALLTHROUGH
 	case 1:			// client, target host, default port
 		remote_host = argv[0];
@@ -391,6 +469,9 @@ main(int argc, char *argv[]) {
 			exit(0);
 		}
 	}
+
+	snprintf(port_name, sizeof(port_name), "%d", port);
+
 	if (use_syslog)
 		openlog("rseb", LOG_CONS, SYSLOG_SERVICE);
 
@@ -398,7 +479,7 @@ main(int argc, char *argv[]) {
 		if (detach || lflag) {
 			if (family == AF_UNSPEC)
 				family = AF_INET;
-			tfd = create_udp_tunnel_server_listener(port);
+			tfd = create_udp_tunnel_server_listener(port_name);
 			if (tfd < 0)
 				return 11;
 		} else
@@ -410,7 +491,7 @@ main(int argc, char *argv[]) {
 			else
 				family = AF_UNSPEC;
 		}
-		tfd = create_udp_tunnel_to_server(remote_host, port);
+		tfd = create_udp_tunnel_to_server(remote_host, port_name);
 		if (tfd < 0)
 			return 12;
 	}
@@ -456,44 +537,51 @@ main(int argc, char *argv[]) {
 
 		if (FD_ISSET(cap_fd, &fds)) {		// incoming local packet
 			pkt = get_local_packet();
+
+			if (pkt == 0)
+				continue;
+
 			local_packets_sniffed++;
 			local_bytes_sniffed += pkt->len;
 
+			// our network tap should not see or process tunnel traffic,
+			// That is for our tunnel stuff.  Some configurations have
+			// to deliver them.
+
+			if (is_tunnel_traffic(pkt)) {
+				continue;
+			}
+
+			// These are not supposed to cross bridges, I think
+			if (IS_BRIDGE_MULTICAST((struct ether_addr *)&pkt->ehdr->ether_dhost))
+				continue;
+
 			if (!connected) {
-				if (debug > 2) {
+				if (debug >= 5) {
 					Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
 					Log(LOG_DEBUG, "  DNF: not connected");
 				}
 				continue;
 			}
 
-#ifdef notdef
-			// see if we are sniffing our own bridged traffic
-			if (known_remote_eaddr(ETHER(pkt)->ether_shost)) {
-				if (debug > 1)
-					Log(LOG_DEBUG, "  DNF: Own bridged traffic");
-				continue;
-			}
-#endif
+			eaddr_is_local((struct ether_addr *)&pkt->ehdr->ether_shost); // remember local src
 
-			eaddr_is_local(ETHER(pkt)->ether_shost); // remember local src
-
-			// if destination is known to be local, don't forward
-			if (known_local_eaddr(ETHER(pkt)->ether_dhost)) {
+			if (known_local_eaddr((struct ether_addr *)&pkt->ehdr->ether_dhost)) {
 				local_packets_not_needing_tunnel++;
-				if (debug > 2) {
+				if (debug >= 4) {
 					Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
 					Log(LOG_DEBUG, "  DNF: local dest");
 				}
 				continue;
 			}
-			if (debug > 1)
-				Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
 
-			if (debug > 1) {
-				if (IS_EBCAST(ETHER(pkt)->ether_dhost)) {
-					Log(LOG_DEBUG, "  >TUN  dest is broadcast");
-				} else {
+			if (debug >= 3) {
+				if (IS_EBCAST(pkt->ehdr->ether_dhost) ||
+				   IN_CLASSD(pkt->ehdr->ether_dhost)) {
+					Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
+					Log(LOG_DEBUG, "  >TUN  dest is broadcast/multicast");
+				} else if (debug >= 4) {
+					Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
 					Log(LOG_DEBUG, "  >TUN  src/dst locations unknown");
 				}
 			}
@@ -512,7 +600,7 @@ main(int argc, char *argv[]) {
 			if (IS_PROTO(pkt)) {
 				int proto = *(int *)pkt->data;
 				incoming_proto_packets++;
-				if (debug > 1) {
+				if (debug >= 4) {
 					Log(LOG_DEBUG, "<TUN  proto %s", proto_str(proto));
 				}
 
@@ -539,14 +627,13 @@ main(int argc, char *argv[]) {
 						proto);
 				}
 			} else if (connected) {
-				if (debug > 1) {
-					Log(LOG_DEBUG, "<TUN  %s",  pkt_dump_str(pkt));
-					Log(LOG_DEBUG, "  >LOC");
+				if (debug >= 4) {
+					Log(LOG_DEBUG, "LOC<TUN  %s",  pkt_dump_str(pkt));
 				}
-				eaddr_is_remote(ETHER(pkt)->ether_shost);
+				eaddr_is_remote((struct ether_addr *)&pkt->ehdr->ether_shost);
 				put_local_packet(pkt);
 			} else {
-				if (debug > 1)
+				if (debug >= 5)
 					Log(LOG_DEBUG, "  not connected, ignored");
 			}
 			busy = 1;

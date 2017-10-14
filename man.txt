@@ -1,0 +1,12 @@
+RSEB(8) - Really Simple Ethernet Bridge
+
+NAME
+	rseb - really simple Ethernet Bridge
+
+SYNOPSIS
+	rseb [-d [-d [-d]]] [-D] [-i interface] [-l] [-p port] [-s] [-4|-6] [-r] [remote server ip [port]]
+	rseb [-d [-d [-d]]] [-D] [-i interface] [-l] [-p port] [-s] [-4|-6] [-r] [remote server ip [port]]
+BUGS
+
+It is not possible to write a really simple Ethernet bridge.  There
+are too many details, even if one ignores spanning trees and crypto.

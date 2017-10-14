@@ -12,8 +12,6 @@
 
 #include "rseb.h"
 
-u_char ether_bcast[ETHER_ADDR_LEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-
 time_t
 now(void) {
         struct timeval tp;

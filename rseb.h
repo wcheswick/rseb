@@ -18,12 +18,18 @@ typedef enum packet_proto {
 
 typedef struct packet {
 	ssize_t len;
-	const u_char *data;
+	union {
+		const u_char *data;
+		struct ether_header *ehdr;
+	};
 } packet;
 
-#define ETHER(packet)	((struct ether_header *)(packet)->data)
+#define IS_EBCAST(e)	(ETHER_IS_MULTICAST((u_char *)e))
+#define IS_BRIDGE_MULTICAST(e)	(((e)->octet[0] == 0x01) && \
+				((e)->octet[0] == 0x80) && \
+				((e)->octet[0] == 0xc2)) 
 
-#define IS_EBCAST(e)	(memcmp(e, ether_bcast, ETHER_ADDR_LEN) == 0)
+#define ESTRLEN	(ETHER_ADDR_LEN*3)
 
 
 /* main.c */
@@ -34,24 +40,22 @@ extern	int use_syslog;
 extern	void Log(int level, char *msg, ...);
 extern	time_t now(void);
 
-extern	u_char ether_bcast[ETHER_ADDR_LEN];
-
 /* debug.c */
 extern	char *e_hdr_str(struct ether_header *hdr);
 extern	char *pkt_dump_str(packet *p);
-extern	void ether_print(u_char *eaddr, char *buf);
+extern	void ether_print(struct ether_addr *eaddr, char *buf);
 extern	char *sa_str(struct sockaddr *sa);
 extern	char *pkt_str(packet *p);
 extern	char *proto_str(packet_proto pp);
 
 /* db.c */
 extern	void init_db(void);
-extern	int known_local_eaddr(u_char addr[ETHER_ADDR_LEN]);
-extern	int known_remote_eaddr(u_char addr[ETHER_ADDR_LEN]);
-extern	void eaddr_is_local(u_char new[ETHER_ADDR_LEN]);
-extern	void eaddr_is_remote(u_char new[ETHER_ADDR_LEN]);
+extern	int known_local_eaddr(struct ether_addr *addr);
+extern	int known_remote_eaddr(struct ether_addr *addr);
+extern	void eaddr_is_local(struct ether_addr *new);
+extern	void eaddr_is_remote(struct ether_addr *new);
 
-extern	char *ether_addr(u_char *eaddr);
+extern	char *ether_addr(struct ether_addr *eaddr);
 extern	char *hex(u_char *b);
 extern	void dump_local_eaddrs(void);
 extern	void dump_remote_eaddrs(void);
@@ -61,4 +65,5 @@ extern	char *local_dev(void);
 extern	int init_capio(char *dev);
 extern	packet *get_local_packet(void);
 extern	void put_local_packet(packet *pkt);
+//extern	void exclude_tunnel_endpoints(packet *pkt);
 
