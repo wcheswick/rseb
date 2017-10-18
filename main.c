@@ -35,7 +35,7 @@
 #include "arg.h"
 
 #define RSEB_PORT	1127
-#define REPORT_INTERVAL	(5*60) // (60*60) // 10	// (60*60)	// in seconds
+#define REPORT_INTERVAL	(60*60)	// in seconds
 
 //	debug >= 1	misc debug
 //	debug >= 2	all - unconnected - known local - multicast
