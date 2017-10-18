@@ -22,7 +22,44 @@
 
 #include "rseb.h"
 
-int rawfd = -1;
+int out_fd = -1;
+
+#ifdef DOESNTWORK
+// On some FreeBSD devices, bpf outputs don't seem to generate actual broadcast
+// packets.  So we use a separate, secret, internal connection to a raw socket
+// to do this.
+
+int
+open_raw(char *dev) {
+	struct ifreq ifr;
+	const int on = 1;
+	int s;
+
+	s = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+	if (s < 0) {
+		Log(LOG_ERR, "Cannot open raw device: %s",
+			strerror(errno));
+		return -1;
+	}
+
+	if (setsockopt(s, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on)) < 0) {
+		Log(LOG_ERR, "raw device initialization: IP_HDRINCL: %s",
+			strerror(errno));
+		return -1;
+	}
+
+#ifdef broken
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, dev, sizeof(ifr.ifr_name));
+	if (ioctl (s, BIOCSETIF, &ifr) < 0) {
+		Log(LOG_ERR, "BIOSETIF failed for %s: %s", dev,
+			strerror(errno));
+		return -1;
+	}
+#endif
+	return s;
+}
+#endif
 
 u_char *bpfbuf = 0;
 size_t bpf_buflen;
@@ -30,7 +67,7 @@ u_char *bufptr;
 int bytes_in_buf = 0;
 
 packet *
-get_local_packet(void) {
+get_local_packet(int bpfd) {
 	struct bpf_hdr *hdr;
 	static packet p;
 
@@ -38,7 +75,7 @@ get_local_packet(void) {
 		int n;
 
 		memset(bpfbuf, 0, bpf_buflen);
-		n = bytes_in_buf = read(rawfd, bpfbuf, bpf_buflen);
+		n = bytes_in_buf = read(bpfd, bpfbuf, bpf_buflen);
 
 		if (n <= 0) {
 			if (n < 0)
@@ -63,7 +100,7 @@ void
 put_local_packet(packet *pkt) {
 	int n;
 
-	n = write(rawfd, pkt->data, pkt->len);
+	n = write(out_fd, pkt->data, pkt->len);
 	if (n < 0) {
 		Log(LOG_WARNING, "raw write error: %s",
 			strerror(errno));
@@ -128,18 +165,19 @@ int
 init_capio(char *dev) {
 	static char device_name[10];
 	char path[20];
-	int i;
+	int i, bpf_fd = -1;
 	struct ifreq ifr;
 	u_int32_t enable = 1;
-	u_int32_t disable = 0;
+//	u_int32_t disable = 0;
 	u_int32_t direction = BPF_D_INOUT;
+	struct timeval bpf_timeout = {0, 2000};	// 2 us
 
 	for (i = 0; i < 255; i++) {
                 snprintf(device_name, sizeof(device_name), "bpf%u", i);
                 snprintf(path, sizeof(path), "/dev/%s", device_name);
 
-		rawfd = open(path, O_RDWR);
-		if (rawfd >= 0)
+		bpf_fd = open(path, O_RDWR);
+		if (bpf_fd >= 0)
 			break;
 
 		switch (errno) {
@@ -151,10 +189,12 @@ init_capio(char *dev) {
 			return -1;
 		}
         }
-	if (rawfd < 0)
+	if (bpf_fd < 0) {
+		Log(LOG_ERR, "Could not find /dev/bpfXX");
 		return -1;
+	}
 
-	if (ioctl(rawfd, BIOCGBLEN, &bpf_buflen) < 0) {
+	if (ioctl(bpf_fd, BIOCGBLEN, &bpf_buflen) < 0) {
 		Log(LOG_ERR, "BIOCGBLEN failed for %s: %s", dev,
 			strerror(errno));
 		return -1;
@@ -165,130 +205,48 @@ init_capio(char *dev) {
 
 	memset(&ifr, 0, sizeof(ifr));
 	strncpy(ifr.ifr_name, dev, sizeof(ifr.ifr_name));
-	if (ioctl (rawfd, BIOCSETIF, &ifr) < 0) {
+	if (ioctl (bpf_fd, BIOCSETIF, &ifr) < 0) {
 		Log(LOG_ERR, "BIOSETIF failed for %s: %s", dev,
 			strerror(errno));
 		return -1;
 	}
 
-	if (ioctl(rawfd, BIOCPROMISC, &enable) < 0) {
+	if (ioctl(bpf_fd, BIOCPROMISC, &enable) < 0) {
 		Log(LOG_ERR, "BIOCPROMISC failed for %s: %s", dev,
 			strerror(errno));
 		return -1;
 	}
 
 	/* Disable header complete mode: we supply everything */
-	if (ioctl(rawfd, BIOCSHDRCMPLT, &disable) < 0) {
+	if (ioctl(bpf_fd, BIOCSHDRCMPLT, &enable) < 0) {
 		Log(LOG_ERR, "BIOCSHDRCMPLT failed for %s: %s",
 			dev, strerror(errno));
 		return -1;
 	}
 
 	/* Do not monitor packets sent from our interface */
-	if (ioctl(rawfd, BIOCSDIRECTION, &direction) < 0) {
+	if (ioctl(bpf_fd, BIOCSDIRECTION, &direction) < 0) {
 		Log(LOG_ERR, "BIOCSSEESENT failed for %s: %s",
 			dev, strerror(errno));
 		return -1;
 	}
 
 	/* Return immediately when a packet received */
-	if (ioctl(rawfd, BIOCIMMEDIATE, &enable) < 0) {
+	if (ioctl(bpf_fd, BIOCIMMEDIATE, &enable) < 0) {	// this doesn't seem to work
 		Log(LOG_ERR, "BIOCIMMEDIATE failed for %s: %s",
 			dev, strerror(errno));
 		return -1;
 	}
 
-	Log(LOG_DEBUG, "Using %s on fd %d", path, rawfd);
-	return rawfd;
-}
-
-// set up a filter to ignore tunnel traffic. This should be done
-// with a filter, but that takes three wise men and a virgin, and
-// I need to get this working.
-
-u_short		excluded_ether_type;
-struct ether_addr excluded_ether_host_a;
-struct ether_addr excluded_ether_host_b;
-u_char		excluded_protocol;	// iff ethertype ip or ipv6
-u_short		excluded_port;		// iff TCP or UDP, destination port
-
-void
-exclude_tunnel_endpoints(packet *p) {
-	uint8_t *protohdr;
-	char exclude_str[300] = "";
-
-Log(LOG_DEBUG, "filtering based on packet %s", pkt_dump_str(p));
-
-	excluded_ether_type = ntohs(p->ehdr->ether_type);
-	memcpy(&excluded_ether_host_a, &p->ehdr->ether_shost, sizeof(excluded_ether_host_a));
-	memcpy(&excluded_ether_host_b, &p->ehdr->ether_dhost, sizeof(excluded_ether_host_a));
-
-	strcat(exclude_str, ether_addr(&excluded_ether_host_a));
-	strcat(exclude_str, " ");
-	strcat(exclude_str, ether_addr(&excluded_ether_host_b));
-
-	switch (excluded_ether_type) {
-	case ETHERTYPE_IP: {
-		struct ip *ip = (struct ip *)((u_char *)p->ehdr +
-			sizeof(struct ether_header));
-		int proto = ip->ip_p;
-
-		strcat(exclude_str, " IPv4");
-		protohdr = ((u_char *)ip + sizeof(struct ip));
-		switch (proto) {
-		case IPPROTO_TCP: {
-			struct tcphdr *tcph = (struct tcphdr *)((u_char *)ip + 
-				sizeof(struct ip));
-			excluded_protocol = proto;
-			strcat(exclude_str, " TCP");
-			excluded_port = ntohs(tcph->th_dport);
-			break;
-		}
-		case IPPROTO_UDP: {
-			struct udphdr *udph = (struct udphdr *)((u_char *)ip +
-				sizeof(struct ip));
-			excluded_protocol = proto;
-			strcat(exclude_str, " UDP");
-			excluded_port = ntohs(udph->uh_dport);
-			break;
-		}
-		case IPPROTO_ICMP:
-		default: 
-			;
-		}
-		break;
+	/* Return immediately when a packet received */
+	if (ioctl(bpf_fd, BIOCSRTIMEOUT, &bpf_timeout) < 0) {	// this doesn't seem to work
+		Log(LOG_ERR, "BIOCSRTIMEOUT failed for %s: %s",
+			dev, strerror(errno));
+		return -1;
 	}
-	case ETHERTYPE_IPV6: {
-		struct ip6_hdr *ip6 = (struct ip6_hdr *)((u_char *)p->ehdr + 
-			sizeof(struct ether_header));
-		int proto = ip6->ip6_nxt;
 
-		strcat(exclude_str, " IPv6");
-		switch (proto) {
-		case IPPROTO_TCP: {
-			struct tcphdr *tcph = (struct tcphdr *)((u_char *)ip6 + 
-				sizeof(*ip6));
-			excluded_protocol = proto;
-			strcat(exclude_str, " TCP");
-			excluded_port = ntohs(tcph->th_dport);
-			break;
-		}
-		case IPPROTO_UDP: {
-			struct udphdr *udph = (struct udphdr *)((u_char *)ip6 +
-				sizeof(*ip6));
-			excluded_protocol = proto;
-			strcat(exclude_str, " UDP");
-			excluded_port = ntohs(udph->uh_dport);
-			break;
-		}
-		case IPPROTO_ICMP:
-		default: 
-			;
-		}
-	}
-	default:
-		;
-	}
-	Log(LOG_DEBUG, "filtering %s", exclude_str);
-abort();
+	out_fd = bpf_fd;
+
+	Log(LOG_DEBUG, "Using %s on fd %d", path, bpf_fd);
+	return bpf_fd;
 }

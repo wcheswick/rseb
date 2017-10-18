@@ -24,7 +24,9 @@ typedef struct packet {
 	};
 } packet;
 
-#define IS_EBCAST(e)	(ETHER_IS_MULTICAST((u_char *)e))
+#define IS_EBCAST(e)	(!memcmp(((struct ether_addr *)&(e)), &ether_bcast, sizeof(ether_bcast)))
+
+#define IS_EBMCAST(e)	(ETHER_IS_MULTICAST((u_char *)e))
 #define IS_BRIDGE_MULTICAST(e)	(((e)->octet[0] == 0x01) && \
 				((e)->octet[0] == 0x80) && \
 				((e)->octet[0] == 0xc2)) 
@@ -39,6 +41,7 @@ extern	int use_syslog;
 /* util.c */
 extern	void Log(int level, char *msg, ...);
 extern	time_t now(void);
+extern	struct ether_addr ether_bcast;
 
 /* debug.c */
 extern	char *e_hdr_str(struct ether_header *hdr);
@@ -63,7 +66,5 @@ extern	void dump_remote_eaddrs(void);
 /* localio.c */
 extern	char *local_dev(void);
 extern	int init_capio(char *dev);
-extern	packet *get_local_packet(void);
+extern	packet *get_local_packet(int fd);
 extern	void put_local_packet(packet *pkt);
-//extern	void exclude_tunnel_endpoints(packet *pkt);
-

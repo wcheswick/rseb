@@ -15,23 +15,36 @@
 #include <netinet/in.h>
 #include <errno.h>
 
+#include <fcntl.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <assert.h>
+
 #include "rseb.h"
 
 
-XXX this crashes FreeBSD at the moment.
-
 int rawfd = -1;
 
-struct ifreq if_idx;	// for writing to the raw interface
+u_char inbuf[10000];
 
 packet *
 get_local_packet(void) {
-	static u_char buf[20000];
-	int n = read(rawfd, buf, sizeof(buf));
 	static packet p;
+	int n = read(rawfd, inbuf, sizeof(inbuf));
 
-	p.data = buf;
+	if (n <= 0) {
+		if (n < 0) {
+			Log(LOG_WARNING, "get_local_packet read error: %s", 
+				strerror(errno));
+		}
+		return 0;
+	}
+
+	p.data = (u_char *)inbuf;
 	p.len = n;
+
 	return &p;
 }
 
@@ -41,9 +54,12 @@ put_local_packet(packet *pkt) {
 
 	n = write(rawfd, pkt->data, pkt->len);
 	if (n < 0) {
-		Log(LOG_WARNING, "raw write error: %s",
+		Log(LOG_WARNING, "put_local_packet write error: %s",
 			strerror(errno));
 	}
+	if (n != pkt->len)
+		Log(LOG_WARNING, "put_local_packet write short packet, %d != %d",
+			n, pkt->len);
 }
 
 char *
@@ -74,8 +90,6 @@ local_dev(void) {
 	ifreq=ifconf.ifc_req;
 	for (i=0; i<ifconf.ifc_len; ) {
 		short flags = ifreq->ifr_flags;
-//Log(LOG_DEBUG, "%.04x interface %s", flags, ifreq->ifr_name);
-//		if ((flags & IFF_UP) && !(flags & IFF_LOOPBACK))
 		if (!(flags & IFF_LOOPBACK)) {
 			close(rfd);
 			return ifreq->ifr_name;
@@ -96,7 +110,6 @@ local_dev(void) {
 }
 
 // What about AF_INET6?
-// XXX which interface?
 
 int
 init_capio(char *dev) {
@@ -110,9 +123,6 @@ init_capio(char *dev) {
 		return -1;
 	}
 
-	memset(&ifr, 0, sizeof(ifr));
-	snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", dev);
-
 	if (setsockopt(rawfd, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on)) < 0) {
 		Log(LOG_ERR, "raw device initialization: IP_HDRINCL: %s",
 			strerror(errno));
@@ -121,12 +131,58 @@ init_capio(char *dev) {
 
 	memset(&ifr, 0, sizeof(ifr));
 	strncpy(ifr.ifr_name, dev, sizeof(ifr.ifr_name));
+	if (ioctl (rawfd, BIOCSETIF, &ifr) < 0) {
+		Log(LOG_ERR, "BIOSETIF failed for %s: %s", dev,
+			strerror(errno));
+		return -1;
+	}
+
+#ifdef notdef
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, dev, sizeof(ifr.ifr_name));
 	ifr.ifr_flags |= IFF_PROMISC;
 	if (ioctl (rawfd, SIOCSIFFLAGS, &ifr) < 0) {
 		Log(LOG_ERR, "init_capio of %s: %s", dev,
 			strerror(errno));
 		return -1;
 	}
+#endif
+
+#ifdef BPF
+	if (ioctl(rawfd, BIOCPROMISC, &enable) < 0) {
+		Log(LOG_ERR, "BIOCPROMISC failed for %s: %s", dev,
+			strerror(errno));
+		return -1;
+	}
+
+	/* Disable header complete mode: we supply everything */
+	if (ioctl(rawfd, BIOCSHDRCMPLT, &enable) < 0) {
+		Log(LOG_ERR, "BIOCSHDRCMPLT failed for %s: %s",
+			dev, strerror(errno));
+		return -1;
+	}
+
+	/* Do not monitor packets sent from our interface */
+	if (ioctl(rawfd, BIOCSDIRECTION, &direction) < 0) {
+		Log(LOG_ERR, "BIOCSSEESENT failed for %s: %s",
+			dev, strerror(errno));
+		return -1;
+	}
+
+	/* Return immediately when a packet received */
+	if (ioctl(rawfd, BIOCIMMEDIATE, &enable) < 0) {	// this doesn't seem to work
+		Log(LOG_ERR, "BIOCIMMEDIATE failed for %s: %s",
+			dev, strerror(errno));
+		return -1;
+	}
+
+	/* Return immediately when a packet received */
+	if (ioctl(rawfd, BIOCSRTIMEOUT, &bpf_timeout) < 0) {	// this doesn't seem to work
+		Log(LOG_ERR, "BIOCSRTIMEOUT failed for %s: %s",
+			dev, strerror(errno));
+		return -1;
+	}
+#endif
 
 #ifdef notdef
 	n = 1500;
@@ -141,3 +197,4 @@ others?
 	
 	return rawfd;
 }
+

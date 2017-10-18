@@ -2,34 +2,46 @@
 //
 //	pcap interface to local network. 
 
-XXX  Has buffering problems, and doesn't seem to be worth the further hassle for debugging.
+//	XXX  Has buffering problems.
 
 #include <pcap.h>
+#include <assert.h>
 
 #include "rseb.h"
 
-struct ifreq if_idx;	// for writing to the raw interface
-
-pcap_t *pcap_handle;
+pcap_t *pcap_handle = 0;
 char pcap_err_buf[PCAP_ERRBUF_SIZE];
 
-#define PCAP_FILTER	"arp or broadcast"
+// #define PCAP_FILTER	"arp or broadcast"
 
 // return an fd for the pcap device if all is ok
 
 int
-init_pcap(char *dev) {
+init_capio(char *dev) {
 #ifdef brokenfilter
 	struct bpf_program fp;
 #endif
 	int fd, rc;
 
+	assert(pcap_handle == NULL);	// call only once
+
 	pcap_handle = pcap_create(dev, pcap_err_buf);
-	if (!pcap_handle) {
+	if (pcap_handle == NULL) {
 		Log(LOG_ERR, "pcap_create: could not start pcap, interface '%s': %s",
-			dev, pcap_err_buf);
+			dev, pcap_geterr(pcap_handle));
 		return -1;
 	}
+	if (pcap_set_timeout(pcap_handle, 1) != 0) {
+		Log(LOG_ERR, "pcap_set_timeout, interface: %s",
+			pcap_geterr(pcap_handle));
+		return -1;
+	}
+	if (pcap_set_immediate_mode(pcap_handle, 1) != 0) {
+		Log(LOG_ERR, "pcap_set_immediate_mode: %s", 
+			pcap_geterr(pcap_handle));
+		return -1;
+	}
+
 #ifdef notdef
 	if (!pcap_setdirection(pcap_handle, PCAP_D_INOUT)) {	// want PCAP_D_IN?
 		Log(LOG_ERR, "pcap_setdirection: pcap cannot set capture direction: %s", 
@@ -59,12 +71,13 @@ init_pcap(char *dev) {
 			rc, pcap_geterr(pcap_handle));
 		return -1;
 	}
-
+#ifdef doesnotseemtowork
 	if (!pcap_set_timeout(pcap_handle, 1)) {
 		Log(LOG_ERR, "pcap_set_timeout: cannot set timeout: %s", 
 			pcap_geterr(pcap_handle));
 		return -1;
 	}
+#endif
 	if (!pcap_set_snaplen(pcap_handle, 2000)) {
 		Log(LOG_ERR, "pcap cannot set snap length: %s", 
 			pcap_geterr(pcap_handle));
@@ -121,7 +134,7 @@ init_pcap(char *dev) {
 }
 
 packet *
-get_local_packet(void) {
+get_local_packet(int bpfd) {	// we ignore the fd, we have the pcap_handle
 	struct pcap_pkthdr *phdr;
 	static packet p;
 	int rc = pcap_next_ex(pcap_handle, &phdr, &p.data);
@@ -165,9 +178,4 @@ local_dev(void) {
 		return NULL;
 	}
 	return dev;
-}
-
-int
-init_capio(char *dev) {
-	return init_pcap(dev);
 }

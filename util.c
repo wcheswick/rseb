@@ -12,6 +12,10 @@
 
 #include "rseb.h"
 
+struct ether_addr ether_bcast = {
+	{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+};
+
 time_t
 now(void) {
         struct timeval tp;
@@ -24,9 +28,7 @@ void
 Log(int level, char *msg, ...) {
 	va_list args;
 
-	if (level == LOG_DEBUG && debug < 2)
-		return;
-	if (level == LOG_INFO && debug < 1)
+	if (level == LOG_DEBUG && !debug)
 		return;
 
 	if (use_syslog) {

@@ -35,15 +35,19 @@
 #include "arg.h"
 
 #define RSEB_PORT	1127
-#define REPORT_INTERVAL	(60*60) // 10	// (60*60)	// in seconds
+#define REPORT_INTERVAL	(5*60) // (60*60) // 10	// (60*60)	// in seconds
 
 //	debug >= 1	misc debug
-//	debug >= 2	all - unconnected - known local - broadcast/multicast
+//	debug >= 2	all - unconnected - known local - multicast
 //	debug >= 3	all - unconnected - known local
 //	debug >= 4	all - unconnected
 //	debug >= 5	all
+//	debug >= 6	all + tunnel reflected
 
 int debug = 0;
+int debug_tun_output = 0;
+int debug_no_traffic_transmit = 0;
+
 int use_syslog = 1;
 
 int report_time = 0;
@@ -59,6 +63,7 @@ int outgoing_tunnel_packets = 0;
 int outgoing_tunnel_bytes = 0;
 int incoming_proto_packets = 0;
 int outgoing_proto_packets = 0;
+int local_multicast = 0;
 int short_packets = 0;
 
 int reports = 0;
@@ -197,6 +202,7 @@ send_packet_to_remote(packet *pkt) {
 		}
 		return;
 	}
+//Log(LOG_DEBUG, ">>>TUN %s", pkt_dump_str(pkt));
 	n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, 
 		remote_tunnel_sa, remote_tunnel_sa_size);
 	if (n < 0) {
@@ -225,13 +231,13 @@ send_proto(int proto_msg) {
 }
 
 packet *
-read_tunneled_packet(void) {
+read_tunneled_packet(int fd) {
 	struct sockaddr_storage from_sa;
 	socklen_t from_sa_size = sizeof(from_sa);
 	static u_char buf[1500];
 	static packet p;
 
-	p.len = recvfrom(tfd, buf, sizeof(buf), 0, 
+	p.len = recvfrom(fd, buf, sizeof(buf), 0, 
 		(struct sockaddr *)&from_sa, &from_sa_size);
 	p.data = (const u_char *)&buf;
 	if (!remote_tunnel_sa) {
@@ -280,7 +286,7 @@ is_tunnel_traffic(packet *p) {
 	// we are probably sniffing a packet we just injected locally.  Ignore it.
 
 	if (known_remote_eaddr((struct ether_addr *)&hdr->ether_shost))
-		return 0;
+		return 1;
 
 	ether_type = ntohs(hdr->ether_type);
 	switch (ether_type) {
@@ -341,6 +347,8 @@ do_report(void) {
 	Log(LOG_NOTICE, "                   ignored: %d", loopback_packets_ignored);
 	Log(LOG_NOTICE, "             not forwarded: %d",
 		local_packets_not_needing_tunnel);
+	if (local_multicast)
+		Log(LOG_NOTICE, "           local multicast: %d", local_multicast);
 	if (short_packets)
 		Log(LOG_NOTICE, "             short packets: %d", short_packets);
 	Log(LOG_NOTICE, "          bridge reduction  %.2f %%",
@@ -357,6 +365,7 @@ do_report(void) {
 	loopback_packets_ignored = 0;
 	local_packets_not_needing_tunnel = 0;
 	short_packets = 0;
+	local_multicast = 0;
 
 	dump_local_eaddrs();
 	dump_remote_eaddrs();
@@ -403,6 +412,12 @@ main(int argc, char *argv[]) {
 		break;
 	case 'D':
 		detach = 0;
+		break;
+	case 'T':
+		debug_tun_output = 1;
+		break;
+	case 'n':
+		debug_no_traffic_transmit = 1;
 		break;
 	case 'i':
 		dev = ARGF();
@@ -536,11 +551,9 @@ main(int argc, char *argv[]) {
 		}
 
 		if (FD_ISSET(cap_fd, &fds)) {		// incoming local packet
-			pkt = get_local_packet();
-
+			pkt = get_local_packet(cap_fd);
 			if (pkt == 0)
 				continue;
-
 			local_packets_sniffed++;
 			local_bytes_sniffed += pkt->len;
 
@@ -549,12 +562,14 @@ main(int argc, char *argv[]) {
 			// to deliver them.
 
 			if (is_tunnel_traffic(pkt)) {
+				if (debug >= 6) {
+					Log(LOG_DEBUG, "<LOC!!! %s", pkt_dump_str(pkt));
+					Log(LOG_DEBUG, "  tunnel traffic");
+				}
 				continue;
 			}
 
-			// These are not supposed to cross bridges, I think
-			if (IS_BRIDGE_MULTICAST((struct ether_addr *)&pkt->ehdr->ether_dhost))
-				continue;
+			eaddr_is_local((struct ether_addr *)&pkt->ehdr->ether_shost);
 
 			if (!connected) {
 				if (debug >= 5) {
@@ -564,7 +579,15 @@ main(int argc, char *argv[]) {
 				continue;
 			}
 
-			eaddr_is_local((struct ether_addr *)&pkt->ehdr->ether_shost); // remember local src
+			if (!IS_EBCAST(pkt->ehdr->ether_dhost) &&
+			   IS_EBMCAST(pkt->ehdr->ether_dhost)) {
+				local_multicast++;
+				if (debug >= 3) {
+					Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
+					Log(LOG_DEBUG, "  DNF: local multicast");
+				}
+				continue;
+			}
 
 			if (known_local_eaddr((struct ether_addr *)&pkt->ehdr->ether_dhost)) {
 				local_packets_not_needing_tunnel++;
@@ -575,23 +598,19 @@ main(int argc, char *argv[]) {
 				continue;
 			}
 
-			if (debug >= 3) {
-				if (IS_EBCAST(pkt->ehdr->ether_dhost) ||
-				   IN_CLASSD(pkt->ehdr->ether_dhost)) {
-					Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
-					Log(LOG_DEBUG, "  >TUN  dest is broadcast/multicast");
-				} else if (debug >= 4) {
-					Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
-					Log(LOG_DEBUG, "  >TUN  src/dst locations unknown");
-				}
+			if (debug >= 3 && IS_EBCAST(pkt->ehdr->ether_dhost)) {
+				Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
+				Log(LOG_DEBUG, "  >TUN  dest is broadcast");
 			}
-			outgoing_tunnel_packets++;
-			outgoing_tunnel_bytes += pkt->len;
-			send_packet_to_remote(pkt);
+			if (!debug_no_traffic_transmit) {
+				outgoing_tunnel_packets++;
+				outgoing_tunnel_bytes += pkt->len;
+				send_packet_to_remote(pkt);
+			}
 			busy = 1;
 		}
 		if (FD_ISSET(tfd, &fds)) { 	// remote from the tunnel
-			pkt = read_tunneled_packet();
+			pkt = read_tunneled_packet(tfd);
 			if (!pkt)
 				continue;
 			incoming_tunnel_packets++;
@@ -600,7 +619,7 @@ main(int argc, char *argv[]) {
 			if (IS_PROTO(pkt)) {
 				int proto = *(int *)pkt->data;
 				incoming_proto_packets++;
-				if (debug >= 4) {
+				if (debug >= 4 || debug_tun_output) {
 					Log(LOG_DEBUG, "<TUN  proto %s", proto_str(proto));
 				}
 
@@ -627,14 +646,16 @@ main(int argc, char *argv[]) {
 						proto);
 				}
 			} else if (connected) {
-				if (debug >= 4) {
+				if (debug >= 4 || debug_tun_output) {
 					Log(LOG_DEBUG, "LOC<TUN  %s",  pkt_dump_str(pkt));
 				}
 				eaddr_is_remote((struct ether_addr *)&pkt->ehdr->ether_shost);
 				put_local_packet(pkt);
 			} else {
-				if (debug >= 5)
+				if (debug >= 5 || debug_tun_output) {
+					Log(LOG_DEBUG, "LOC<TUN  %s",  pkt_dump_str(pkt));
 					Log(LOG_DEBUG, "  not connected, ignored");
+				}
 			}
 			busy = 1;
 		}

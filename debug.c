@@ -149,10 +149,9 @@ pkt_dump_str(packet *p) {
 			dbuf = buf2;
 			break;
 		case ARPOP_REPLY:
-			ether_print((struct ether_addr *)ar_tha(ahdr), tgt);
+			ether_print((struct ether_addr *)ar_sha(ahdr), tgt);
 			snprintf(buf2, sizeof(buf2), " reply %s is-at %s",
 				src, tgt);
-			dbuf = buf2;
 			dbuf = buf2;
 			break;
 		default:
@@ -197,6 +196,8 @@ pkt_dump_str(packet *p) {
 			proto_name = "IGMP";
 			break;
 		case IPPROTO_ICMP:
+			proto_name = "ICMP";
+			break;
 		default: {
 			static char buf3[100];
 			snprintf(buf3, sizeof(buf3), "IP proto %d", ip->ip_p);
