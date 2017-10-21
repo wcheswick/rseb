@@ -37,8 +37,8 @@ clean::
 
 
 test::	rseb
-#	sudo ./rseb -d -d -d -T -r -D -s garage-tunnel	# client test
-	sudo ./rseb -d -d -d -d -d -A -T -r -D -s garage-tunnel	# client test
+	sudo ./rseb -r -D -s garage-tunnel	# client test
+#	sudo ./rseb -d -d -d -d -d -d -A -T -r -D -s garage-tunnel	# client test
 
 #	sudo ./rseb -d -d fd72:6574:6e65:7466::20
 #	sudo ./rseb -d		# discover interface

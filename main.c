@@ -54,18 +54,42 @@ int show_arps = 0;
 int report_time = 0;
 int connected = 0;	// If we have seen at least one protocol packet
 
-int local_packets_sniffed = 0;
-int local_bytes_sniffed = 0;
-int local_packets_not_needing_tunnel = 0;
-int loopback_packets_ignored = 0;
-int incoming_tunnel_packets = 0;
-int incoming_tunnel_bytes = 0;
-int outgoing_tunnel_packets = 0;
-int outgoing_tunnel_bytes = 0;
-int incoming_proto_packets = 0;
-int outgoing_proto_packets = 0;
-int local_multicast = 0;
-int short_packets = 0;
+int local_packets_sniffed;
+int local_bytes_sniffed;
+int local_packets_not_needing_tunnel;
+int loopback_packets_ignored;
+int incoming_tunnel_packets;
+int incoming_tunnel_bytes;
+int ignored_captured_tunnel_packets;
+int ignored_captured_tunnel_bytes;
+int unconnected_local_packets;
+int unconnected_local_bytes;
+int outgoing_tunnel_packets;
+int outgoing_tunnel_bytes;
+int incoming_proto_packets;
+int outgoing_proto_packets;
+int local_multicast;
+int short_packets;
+
+void
+zero_stats(void) {
+	local_packets_sniffed = 0;
+	local_bytes_sniffed = 0;
+	local_packets_not_needing_tunnel = 0;
+	loopback_packets_ignored = 0;
+	incoming_tunnel_packets = 0;
+	incoming_tunnel_bytes = 0;
+	ignored_captured_tunnel_packets = 0;
+	ignored_captured_tunnel_bytes = 0;
+	unconnected_local_packets = 0;
+	unconnected_local_bytes = 0;
+	outgoing_tunnel_packets = 0;
+	outgoing_tunnel_bytes = 0;
+	incoming_proto_packets = 0;
+	outgoing_proto_packets = 0;
+	local_multicast = 0;
+	short_packets = 0;
+}
 
 int reports = 0;
 int not_busy = 0;
@@ -258,13 +282,11 @@ read_tunneled_packet(int fd) {
 }
 
 
-// Tunnel traffic has our UDP port at both ends, and specific ethernet
-// addresses when we learn of them.  Tech debt: this should be done
-// in a filter.
-
+#ifdef notsimple
 int have_tunnel_endpoints = 0;
 struct ether_addr tunnel_ether_a;
 struct ether_addr tunnel_ether_b;
+#endif
 
 int
 is_tunnel_traffic(packet *p) {
@@ -274,6 +296,7 @@ is_tunnel_traffic(packet *p) {
 	struct udphdr *udph;
 	uint8_t *protohdr;
 
+#ifdef notsimple
 	if (have_tunnel_endpoints) {
 		if ((memcmp(&hdr->ether_shost, &tunnel_ether_a, ETHER_ADDR_LEN) &&
 		    memcmp(&hdr->ether_dhost, &tunnel_ether_b, ETHER_ADDR_LEN)) ||
@@ -281,16 +304,6 @@ is_tunnel_traffic(packet *p) {
 		    memcmp(&hdr->ether_dhost, &tunnel_ether_a, ETHER_ADDR_LEN)))
 			return 1;
 	}
-
-#ifdef old
-		if (show_arps && is_arp(p)) {
-			Log(LOG_INFO, "src %s", ether_addr((struct ether_addr *)&hdr->ether_shost));
-			Log(LOG_INFO, "dst %s", ether_addr((struct ether_addr *)&hdr->ether_dhost));
-			Log(LOG_INFO, "  a %s", ether_addr(&tunnel_ether_a));
-			Log(LOG_INFO, "  b %s", ether_addr(&tunnel_ether_b));
-			Log(LOG_INFO, "<LOC arp !!! tunnel endpoints: %s", pkt_dump_str(p));
-		}
-#endif
 
 	// If this sniffed packet is coming from a host known to be remote,
 	// we are probably sniffing a packet we just injected locally.  Ignore it.
@@ -301,6 +314,10 @@ is_tunnel_traffic(packet *p) {
 	if (known_remote_eaddr((struct ether_addr *)&hdr->ether_shost)) {
 		if (show_arps && is_arp(p))
 			Log(LOG_INFO, "<LOC arp !!! known remote source: %s", pkt_dump_str(p));
+		return 1;
+	}
+#endif
+	if (known_remote_eaddr((struct ether_addr *)&hdr->ether_shost)) {
 		return 1;
 	}
 
@@ -334,6 +351,7 @@ is_tunnel_traffic(packet *p) {
 	    ntohs(udph->uh_dport) != RSEB_PORT)
 		return 0;
 
+#ifdef notsimple
 	if (!have_tunnel_endpoints) {	// now we do
 		char src[ESTRLEN];
 		char dst[ESTRLEN];
@@ -347,20 +365,84 @@ is_tunnel_traffic(packet *p) {
 		Log(LOG_DEBUG, "Have tunnel info: %s / %s  UDP %hu %hu",
 			src, dst, ntohs(udph->uh_sport), ntohs(udph->uh_dport));
 	}
+#endif
+	return 1;
+}
+
+int
+should_forward_local_packet(packet *pkt) {
+	// our network tap should not see or process tunnel traffic,
+	// That is for our tunnel stuff.  Some configurations have
+	// to deliver them.
+
+	if (is_tunnel_traffic(pkt)) {
+		ignored_captured_tunnel_packets++;
+		ignored_captured_tunnel_bytes += pkt->len;
+		if (debug >= 6) {
+			Log(LOG_DEBUG, "  tunnel traffic");
+		}
+		return 0;
+	}
+
+	eaddr_is_local((struct ether_addr *)&pkt->ehdr->ether_shost);
+
+	// not connected to a packet tunnel
+	if (!connected) {
+		unconnected_local_packets++;
+		unconnected_local_bytes += pkt->len;
+		if (debug >= 5) {
+			Log(LOG_DEBUG, "  DNF: not connected");
+		}
+		return 0;
+	}
+
+	// leloo dallas multicast
+	if (!IS_EBCAST(pkt->ehdr->ether_dhost) &&
+	   IS_EBMCAST(pkt->ehdr->ether_dhost)) {
+		local_multicast++;
+		if (debug >= 3) {
+			Log(LOG_DEBUG, "  DNF: local multicast");
+		}
+		return 0;	// no multicast, for now
+	}
+
+	// local destination
+	if (known_local_eaddr((struct ether_addr *)&pkt->ehdr->ether_dhost)) {
+		local_packets_not_needing_tunnel++;
+		if (debug >= 4) {
+			Log(LOG_DEBUG, "  DNF: local dest");
+		}
+		return 0;
+	}
+
+	if (debug >= 3 && IS_EBCAST(pkt->ehdr->ether_dhost)) {
+		Log(LOG_DEBUG, "  >TUN  dest is broadcast");
+	}
 	return 1;
 }
 
 void
 do_report(void) {
 	reports++;
-	Log(LOG_NOTICE, "   Tunnel incoming traffic: %d/%d",
+	Log(LOG_NOTICE, "     Tunnel incoming traffic: %d/%d",
 		incoming_tunnel_packets, incoming_tunnel_bytes);
-	Log(LOG_NOTICE, "             proto packets: %d", incoming_proto_packets);
-	Log(LOG_NOTICE, "   Tunnel outgoing traffic: %d/%d",
+	Log(LOG_NOTICE, "               proto packets: %d", incoming_proto_packets);
+	Log(LOG_NOTICE, "     Tunnel outgoing traffic: %d/%d",
 		outgoing_tunnel_packets, outgoing_tunnel_bytes);
-	Log(LOG_NOTICE, "             proto packets: %d", outgoing_proto_packets);
-	Log(LOG_NOTICE, "             Local traffic: %d/%d",
+	Log(LOG_NOTICE, "               proto packets: %d", outgoing_proto_packets);
+	Log(LOG_NOTICE, "               Local traffic: %d/%d",
 		local_packets_sniffed, local_bytes_sniffed);
+	if (ignored_captured_tunnel_packets) {
+		Log(LOG_NOTICE, "ignored local tunnel traffic: %d/%d",
+			ignored_captured_tunnel_packets,
+			ignored_captured_tunnel_bytes);
+	}
+	if (unconnected_local_packets) {
+		Log(LOG_NOTICE, "   unconnected local traffic: %d/%d",
+			unconnected_local_packets,
+			unconnected_local_bytes);
+	}
+
 	Log(LOG_NOTICE, "                   ignored: %d", loopback_packets_ignored);
 	Log(LOG_NOTICE, "             not forwarded: %d",
 		local_packets_not_needing_tunnel);
@@ -369,23 +451,49 @@ do_report(void) {
 	if (short_packets)
 		Log(LOG_NOTICE, "             short packets: %d", short_packets);
 	Log(LOG_NOTICE, "          bridge reduction  %.2f %%",
-	    100.0*(local_bytes_sniffed - outgoing_tunnel_bytes)/(double)local_bytes_sniffed);
-
-	incoming_tunnel_packets = 0;
-	incoming_tunnel_bytes = 0;
-	incoming_proto_packets = 0;
-	outgoing_tunnel_packets = 0;
-	outgoing_tunnel_bytes = 0;
-	outgoing_proto_packets = 0;
-	local_packets_sniffed = 0;
-	local_bytes_sniffed = 0;
-	loopback_packets_ignored = 0;
-	local_packets_not_needing_tunnel = 0;
-	short_packets = 0;
-	local_multicast = 0;
+	    100.0*(local_bytes_sniffed - outgoing_tunnel_bytes)/
+		(double)local_bytes_sniffed);
 
 	dump_local_eaddrs();
 	dump_remote_eaddrs();
+
+	zero_stats();
+}
+
+// return 0 if the other end quit
+
+int
+do_proto(packet *pkt) {
+	int proto = *(int *)pkt->data;
+
+	if (debug >= 4 || debug_tun_output) {
+		Log(LOG_DEBUG, "<TUN  proto %s", proto_str(proto));
+	}
+
+	switch (proto) {
+	case Phello:
+		Log(LOG_INFO, "Remote started tunnel session");
+		send_proto(Phelloback);
+		connected = 1;
+		break;
+	case Phelloback:
+		Log(LOG_INFO, "Remote end is alive");
+		connected = 1;
+		break;
+	case Pheartbeat:
+		// Log(LOG_INFO, "Lubdub");
+		connected = 1;
+		break;
+	case Pbye:
+		Log(LOG_INFO, "Session terminated by other end");
+		do_report();
+		send_proto(Pbye);
+		return 0;	// time to exit
+	default:
+		Log(LOG_WARNING, "Unexpected protocol: %d",
+			proto);
+	}
+	return 1;	// keep going
 }
 
 void
@@ -422,6 +530,7 @@ main(int argc, char *argv[]) {
 	}
 
 	init_db();
+	zero_stats();
 
 	ARGBEGIN {
 	case 'd':
@@ -570,112 +679,45 @@ main(int argc, char *argv[]) {
 			return 20;
 		}
 
-		if (FD_ISSET(cap_fd, &fds)) {		// incoming local packet
+		if (FD_ISSET(cap_fd, &fds)) {	// incoming local packet
 			pkt = get_local_packet(cap_fd);
 			if (pkt == 0)
 				continue;
 			local_packets_sniffed++;
 			local_bytes_sniffed += pkt->len;
-
-			// our network tap should not see or process tunnel traffic,
-			// That is for our tunnel stuff.  Some configurations have
-			// to deliver them.
-
-			if (is_tunnel_traffic(pkt)) {
-				if (debug >= 6) {
-					Log(LOG_DEBUG, "<LOC!!! %s", pkt_dump_str(pkt));
-					Log(LOG_DEBUG, "  tunnel traffic");
+if (debug >= 6) Log(LOG_DEBUG, "LOC %s", pkt_dump_str(pkt));
+			if (should_forward_local_packet(pkt)) {
+				if (!debug_no_traffic_transmit) {
+					outgoing_tunnel_packets++;
+					outgoing_tunnel_bytes += pkt->len;
+					send_packet_to_remote(pkt);
 				}
-				continue;
-			}
-
-			eaddr_is_local((struct ether_addr *)&pkt->ehdr->ether_shost);
-
-			if (!connected) {
-				if (debug >= 5) {
-					Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
-					Log(LOG_DEBUG, "  DNF: not connected");
-				}
-				continue;
-			}
-
-			if (!IS_EBCAST(pkt->ehdr->ether_dhost) &&
-			   IS_EBMCAST(pkt->ehdr->ether_dhost)) {
-				local_multicast++;
-				if (debug >= 3) {
-					Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
-					Log(LOG_DEBUG, "  DNF: local multicast");
-				}
-				continue;
-			}
-
-			if (known_local_eaddr((struct ether_addr *)&pkt->ehdr->ether_dhost)) {
-				local_packets_not_needing_tunnel++;
-				if (debug >= 4) {
-					Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
-					Log(LOG_DEBUG, "  DNF: local dest");
-				}
-				continue;
-			}
-
-			if (debug >= 3 && IS_EBCAST(pkt->ehdr->ether_dhost)) {
-				Log(LOG_DEBUG, "<LOC %s", pkt_dump_str(pkt));
-				Log(LOG_DEBUG, "  >TUN  dest is broadcast");
-			}
-			if (!debug_no_traffic_transmit) {
-				outgoing_tunnel_packets++;
-				outgoing_tunnel_bytes += pkt->len;
-				send_packet_to_remote(pkt);
 			}
 			busy = 1;
 		}
-		if (FD_ISSET(tfd, &fds)) { 	// remote from the tunnel
+		if (FD_ISSET(tfd, &fds)) {	// remote from the tunnel
 			pkt = read_tunneled_packet(tfd);
 			if (!pkt)
 				continue;
 			incoming_tunnel_packets++;
 			incoming_tunnel_bytes += pkt->len;
 
+if (debug >= 6) Log(LOG_DEBUG, "TUN %s", pkt_dump_str(pkt));
 			if (IS_PROTO(pkt)) {
-				int proto = *(int *)pkt->data;
 				incoming_proto_packets++;
-				if (debug >= 4 || debug_tun_output) {
-					Log(LOG_DEBUG, "<TUN  proto %s", proto_str(proto));
+				if (!do_proto(pkt))
+					return 0;	// He said goodbye
+			} else if (!connected) {
+				if (debug >= 5 || debug_tun_output) {
+					Log(LOG_DEBUG, "LOC<TUN  %s",  pkt_dump_str(pkt));
+					Log(LOG_DEBUG, "  not connected, ignored");
 				}
-
-				switch (proto) {
-				case Phello:
-					Log(LOG_INFO, "Remote started tunnel session");
-					send_proto(Phelloback);
-					connected = 1;
-					break;
-				case Phelloback:
-					Log(LOG_INFO, "Remote end is alive");
-					connected = 1;
-					break;
-				case Pheartbeat:
-					// Log(LOG_INFO, "Lubdub");
-					connected = 1;
-					break;
-				case Pbye:
-					Log(LOG_INFO, "Session terminated by other end");
-					do_report();
-					return 0;
-				default:
-					Log(LOG_WARNING, "Unexpected protocol: %d",
-						proto);
-				}
-			} else if (connected) {
+			} else {
 				if (debug >= 4 || debug_tun_output) {
 					Log(LOG_DEBUG, "LOC<TUN  %s",  pkt_dump_str(pkt));
 				}
 				eaddr_is_remote((struct ether_addr *)&pkt->ehdr->ether_shost);
 				put_local_packet(pkt);
-			} else {
-				if (debug >= 5 || debug_tun_output) {
-					Log(LOG_DEBUG, "LOC<TUN  %s",  pkt_dump_str(pkt));
-					Log(LOG_DEBUG, "  not connected, ignored");
-				}
 			}
 			busy = 1;
 		}
@@ -696,6 +738,5 @@ main(int argc, char *argv[]) {
 		}
 	}
 
-	send_proto(Pbye);
 	return 0;
 }

@@ -37,7 +37,7 @@ init_db(void) {
 }
 
 static void
-verify_entry(struct ether_addr *eaddr, struct ethernet_tree *root) {
+verify_entry(struct ether_addr *eaddr, struct ethernet_tree *root, char *type) {
 	struct ethernet_entry find, *e;
 
 //	if (IS_EBCAST(new))
@@ -46,14 +46,14 @@ verify_entry(struct ether_addr *eaddr, struct ethernet_tree *root) {
 	memcpy(&find.addr, eaddr, sizeof(find.addr));
 	e = SPLAY_FIND(ethernet_tree, root, &find);
 	if (e) {
-		if (db_debug)
-			Log(LOG_DEBUG, "entry known: %s", ether_addr(eaddr));
+		if (db_debug || debug >= 6)
+			Log(LOG_DEBUG, "%s entry known: %s", type, ether_addr(eaddr));
 		e->count++;
 		e->last_seen = now();
 		return;
 	}
-	if (db_debug)
-		Log(LOG_DEBUG, "new entry: %s", ether_addr(eaddr));
+	if (db_debug || debug >= 6)
+		Log(LOG_DEBUG, "new %s entry: %s", type, ether_addr(eaddr));
 
 	e = (struct ethernet_entry *)malloc(sizeof(struct ethernet_entry));
 	assert(e);
@@ -89,7 +89,7 @@ eaddr_is_remote(struct ether_addr *eaddr) {
 		Log(LOG_INFO, "local device moved to remote: %s", ether_addr(eaddr)); 
 		SPLAY_REMOVE(ethernet_tree, &local_eaddrs, local);
 	}
-	verify_entry(eaddr, &remote_eaddrs);
+	verify_entry(eaddr, &remote_eaddrs, "remote");
 }
 
 void
@@ -104,7 +104,7 @@ eaddr_is_local(struct ether_addr *eaddr) {
 		Log(LOG_INFO, "remote device moved to local: %s", ether_addr(eaddr)); 
 		SPLAY_REMOVE(ethernet_tree, &remote_eaddrs, remote);
 	}
-	verify_entry(eaddr, &local_eaddrs);
+	verify_entry(eaddr, &local_eaddrs, "local");
 }
 
 int

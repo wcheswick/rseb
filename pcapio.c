@@ -42,13 +42,12 @@ init_capio(char *dev) {
 		return -1;
 	}
 
-#ifdef notdef
-	if (!pcap_setdirection(pcap_handle, PCAP_D_INOUT)) {	// want PCAP_D_IN?
+	// ignore the outgoing traffic, which we may well have generated
+	if (!pcap_setdirection(pcap_handle, PCAP_D_IN)) {
 		Log(LOG_ERR, "pcap_setdirection: pcap cannot set capture direction: %s", 
 			pcap_geterr(pcap_handle));
 		return -1;
 	}
-#endif
 
 	rc = pcap_activate(pcap_handle);
 	if (rc > 0) {		// pcap warning
@@ -71,13 +70,6 @@ init_capio(char *dev) {
 			rc, pcap_geterr(pcap_handle));
 		return -1;
 	}
-#ifdef doesnotseemtowork
-	if (!pcap_set_timeout(pcap_handle, 1)) {
-		Log(LOG_ERR, "pcap_set_timeout: cannot set timeout: %s", 
-			pcap_geterr(pcap_handle));
-		return -1;
-	}
-#endif
 	if (!pcap_set_snaplen(pcap_handle, 2000)) {
 		Log(LOG_ERR, "pcap cannot set snap length: %s", 
 			pcap_geterr(pcap_handle));
@@ -122,13 +114,6 @@ init_capio(char *dev) {
 			dev);
 		return -1;
 	}
-#ifdef notdef
-	if (pcap_setdirection(pcap_handle, PCAP_D_IN) < 0) {
-		Log(LOG_ERR, "pcap_setdirection failed for '%s': %s", 
-			dev, pcap_geterr(pcap_handle));
-		return -1;
-	}
-#endif
 
 	return fd;
 }
