@@ -64,24 +64,6 @@ verify_entry(struct ether_addr *eaddr, struct ethernet_tree *root) {
 	SPLAY_INSERT(ethernet_tree, root, e);
 }
 
-void
-eaddr_is_remote(struct ether_addr *eaddr) {
-	if (db_debug)
-		Log(LOG_DEBUG," rem key %s", ether_addr(eaddr));
-	if (IS_EBCAST(eaddr))
-		return;
-	verify_entry(eaddr, &remote_eaddrs);
-}
-
-void
-eaddr_is_local(struct ether_addr *eaddr) {
-	if (db_debug)
-		Log(LOG_DEBUG," loc key %s", ether_addr(eaddr));
-	if (IS_EBCAST(eaddr))
-		return;
-	verify_entry(eaddr, &local_eaddrs);
-}
-
 static struct ethernet_entry *
 find_entry(struct ether_addr *addr, struct ethernet_tree *root) {
 	struct ethernet_entry find, *e;
@@ -93,6 +75,36 @@ find_entry(struct ether_addr *addr, struct ethernet_tree *root) {
 		return e;
 	}
 	return 0;
+}
+
+void
+eaddr_is_remote(struct ether_addr *eaddr) {
+	struct ethernet_entry *local = find_entry(eaddr, &local_eaddrs);
+
+	if (db_debug)
+		Log(LOG_DEBUG," rem key %s", ether_addr(eaddr));
+	if (IS_EBCAST(eaddr))
+		return;
+	if (local) {
+		Log(LOG_INFO, "local device moved to remote: %s", ether_addr(eaddr)); 
+		SPLAY_REMOVE(ethernet_tree, &local_eaddrs, local);
+	}
+	verify_entry(eaddr, &remote_eaddrs);
+}
+
+void
+eaddr_is_local(struct ether_addr *eaddr) {
+	struct ethernet_entry *remote = find_entry(eaddr, &remote_eaddrs);
+
+	if (db_debug)
+		Log(LOG_DEBUG," loc key %s", ether_addr(eaddr));
+	if (IS_EBCAST(eaddr))
+		return;
+	if (remote) {
+		Log(LOG_INFO, "remote device moved to local: %s", ether_addr(eaddr)); 
+		SPLAY_REMOVE(ethernet_tree, &remote_eaddrs, remote);
+	}
+	verify_entry(eaddr, &local_eaddrs);
 }
 
 int
@@ -127,30 +139,24 @@ void
 dump_local_eaddrs(void) {
 	time_t t = now();
 	struct ethernet_entry *e;
-
-	if (!debug)
-		return;
 	
-	Log(LOG_DEBUG, "Local MACs:");
+	Log(LOG_NOTICE, "Local MACs:");
 	SPLAY_FOREACH(e, ethernet_tree, &local_eaddrs) {
-		Log(LOG_INFO, "%s %7d  %5d",
+		Log(LOG_NOTICE, "%s %7d  %5d",
 			ether_addr(&e->addr), e->count, t - e->last_seen);
 	}
-	Log(LOG_DEBUG, "-----------");
+	Log(LOG_NOTICE, "-----------");
 }
 
 void
 dump_remote_eaddrs(void) {
 	time_t t = now();
 	struct ethernet_entry *e;
-
-	if (!debug)
-		return;
 	
-	Log(LOG_DEBUG, "Remote MACs:");
+	Log(LOG_NOTICE, "Remote MACs:");
 	SPLAY_FOREACH(e, ethernet_tree, &remote_eaddrs) {
-		Log(LOG_INFO, "%s %7d  %5d",
+		Log(LOG_NOTICE, "%s %7d  %5d",
 			ether_addr(&e->addr), e->count, t - e->last_seen);
 	}
-	Log(LOG_DEBUG, "-----------");
+	Log(LOG_NOTICE, "-----------");
 }

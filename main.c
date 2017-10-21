@@ -35,7 +35,7 @@
 #include "arg.h"
 
 #define RSEB_PORT	1127
-#define REPORT_INTERVAL	(60*60)	// in seconds
+#define REPORT_INTERVAL	(5*60) // (60*60)	// in seconds
 
 //	debug >= 1	misc debug
 //	debug >= 2	all - unconnected - known local - multicast
@@ -49,6 +49,7 @@ int debug_tun_output = 0;
 int debug_no_traffic_transmit = 0;
 
 int use_syslog = 1;
+int show_arps = 0;
 
 int report_time = 0;
 int connected = 0;	// If we have seen at least one protocol packet
@@ -274,19 +275,34 @@ is_tunnel_traffic(packet *p) {
 	uint8_t *protohdr;
 
 	if (have_tunnel_endpoints) {
-		if (!memcmp(hdr->ether_shost, &tunnel_ether_a, ETHER_ADDR_LEN) &&
-		    !memcmp(hdr->ether_dhost, &tunnel_ether_a, ETHER_ADDR_LEN))
-			return 0;
-		if (!memcmp(hdr->ether_shost, &tunnel_ether_b, ETHER_ADDR_LEN) &&
-		    !memcmp(hdr->ether_shost, &tunnel_ether_b, ETHER_ADDR_LEN))
-			return 0;
+		if ((memcmp(&hdr->ether_shost, &tunnel_ether_a, ETHER_ADDR_LEN) &&
+		    memcmp(&hdr->ether_dhost, &tunnel_ether_b, ETHER_ADDR_LEN)) ||
+		    (memcmp(&hdr->ether_shost, &tunnel_ether_b, ETHER_ADDR_LEN) &&
+		    memcmp(&hdr->ether_dhost, &tunnel_ether_a, ETHER_ADDR_LEN)))
+			return 1;
 	}
+
+#ifdef old
+		if (show_arps && is_arp(p)) {
+			Log(LOG_INFO, "src %s", ether_addr((struct ether_addr *)&hdr->ether_shost));
+			Log(LOG_INFO, "dst %s", ether_addr((struct ether_addr *)&hdr->ether_dhost));
+			Log(LOG_INFO, "  a %s", ether_addr(&tunnel_ether_a));
+			Log(LOG_INFO, "  b %s", ether_addr(&tunnel_ether_b));
+			Log(LOG_INFO, "<LOC arp !!! tunnel endpoints: %s", pkt_dump_str(p));
+		}
+#endif
 
 	// If this sniffed packet is coming from a host known to be remote,
 	// we are probably sniffing a packet we just injected locally.  Ignore it.
 
-	if (known_remote_eaddr((struct ether_addr *)&hdr->ether_shost))
+	if (show_arps && is_arp(p))
+		Log(LOG_INFO, "<LOC arp x3: %s", pkt_dump_str(p));
+
+	if (known_remote_eaddr((struct ether_addr *)&hdr->ether_shost)) {
+		if (show_arps && is_arp(p))
+			Log(LOG_INFO, "<LOC arp !!! known remote source: %s", pkt_dump_str(p));
 		return 1;
+	}
 
 	ether_type = ntohs(hdr->ether_type);
 	switch (ether_type) {
@@ -308,6 +324,8 @@ is_tunnel_traffic(packet *p) {
 		return 0;	// can't be a UDP packet
 	}
 
+	if (is_arp(p))
+		abort();
 	if (proto != IPPROTO_UDP)
 		return 0;
 
@@ -329,7 +347,6 @@ is_tunnel_traffic(packet *p) {
 		Log(LOG_DEBUG, "Have tunnel info: %s / %s  UDP %hu %hu",
 			src, dst, ntohs(udph->uh_sport), ntohs(udph->uh_dport));
 	}
-
 	return 1;
 }
 
@@ -381,7 +398,7 @@ interrupt(int i) {
 
 int
 usage(void) {
-	fprintf(stderr, "usage: rseb [-d [-d [-d]]] [-D] [-i interface] [-l] [-p port] [-s] [-4|-6] [-r] [remote server ip [port]]\n");
+	fprintf(stderr, "usage: rseb [-A] [-d [-d [-d]]] [-D] [-i interface] [-l] [-p port] [-s] [-4|-6] [-r] [remote server ip [port]]\n");
 	return 1;
 }
 
@@ -439,6 +456,9 @@ main(int argc, char *argv[]) {
 		break;
 	case '6':
 		family = AF_INET6;
+		break;
+	case 'A':
+		show_arps = 1;
 		break;
 	default:
 		return usage();

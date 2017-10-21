@@ -120,6 +120,12 @@ hex(u_char *b) {
 	return buf;
 }
 
+int
+is_arp(packet *p) {
+	struct ether_header *hdr = (struct ether_header *)p->data;
+	return ntohs(hdr->ether_type) == ETHERTYPE_ARP;
+}
+
 char *
 pkt_dump_str(packet *p) {
 	struct ether_header *hdr = (struct ether_header *)p->data;

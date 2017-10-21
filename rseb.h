@@ -50,6 +50,7 @@ extern	void ether_print(struct ether_addr *eaddr, char *buf);
 extern	char *sa_str(struct sockaddr *sa);
 extern	char *pkt_str(packet *p);
 extern	char *proto_str(packet_proto pp);
+extern	int is_arp(packet *p);
 
 /* db.c */
 extern	void init_db(void);
