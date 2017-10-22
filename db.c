@@ -40,9 +40,6 @@ static void
 verify_entry(struct ether_addr *eaddr, struct ethernet_tree *root, char *type) {
 	struct ethernet_entry find, *e;
 
-//	if (IS_EBCAST(new))
-//		return;
-
 	memcpy(&find.addr, eaddr, sizeof(find.addr));
 	e = SPLAY_FIND(ethernet_tree, root, &find);
 	if (e) {

@@ -1,4 +1,7 @@
-/* debug: derived from tcpdump's print-ether */
+/* debug: derived from tcpdump's print-ether
+ *
+ * Like much debugging code, this routine probably has security issues.
+ */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,12 +168,6 @@ pkt_dump_str(packet *p) {
 				(void *)hdr, (u_long)sizeof(struct ether_header),
 				(void *)ahdr,
 				hex((u_char *)hdr));
-#ifdef notdef
-			snprintf(buf2, sizeof(buf2), "  %.04x %.04x %02x %02x %.04x",
-				ahdr->ar_hrd, ahdr->ar_pro, ahdr->ar_hln,
-				ahdr->ar_pln, ahdr->ar_op);
-			snprintf(buf2, sizeof(buf2), " code %d", arp_code);
-#endif
 			dbuf = buf2;
 		}
 		break;

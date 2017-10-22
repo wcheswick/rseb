@@ -2,8 +2,6 @@
 //
 //	pcap interface to local network. 
 
-//	XXX  Has buffering problems.
-
 #include <pcap.h>
 #include <assert.h>
 
@@ -43,6 +41,9 @@ init_capio(char *dev) {
 	}
 
 	// ignore the outgoing traffic, which we may well have generated
+	// This does not appear to be useful on my test configuration, so
+	// I have to worry about tunnel traffic sniffed on the local ethernet
+
 	if (!pcap_setdirection(pcap_handle, PCAP_D_IN)) {
 		Log(LOG_ERR, "pcap_setdirection: pcap cannot set capture direction: %s", 
 			pcap_geterr(pcap_handle));

@@ -1,41 +1,41 @@
+/* rseb - really simple Ethernet bridge.
+ *
+ * The idea is simple, but it turns out bridging takes work.  This code
+ * has only been tested and deployed on FreeBSD machines.  It ought to
+ * work with few or no changes on Linux.
+ *
+ * Bill Cheswick, autumn 2017, Flemington, NJ.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <string.h>
 #include <errno.h>
 #include <signal.h>
 #include <assert.h>
 
-#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <netinet/in_systm.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
-#include <arpa/inet.h>
-#include <netinet/ip_icmp.h>
 #include <netinet/udp.h>
-#include <netinet/tcp.h>
-#include <sys/un.h>
-#include <stdarg.h>
 #include <sys/select.h>
 
-#ifdef __FreeBSD__
-#include <sys/sockio.h>
-#include <sys/limits.h>
-#else
-#include <linux/sockios.h>
+#ifndef __FreeBSD__
+#include <linux/sockios.h>	// not clear if this is needed
 #endif
 
 #include "rseb.h"
 #include "arg.h"
 
+
 #define RSEB_PORT	1127
-#define REPORT_INTERVAL	(5*60) // (60*60)	// in seconds
+#define	SYSLOG_SERVICE	LOG_LOCAL1
+#define REPORT_INTERVAL	(60*60)	// in seconds
 
 //	debug >= 1	misc debug
 //	debug >= 2	all - unconnected - known local - multicast
@@ -57,7 +57,6 @@ int connected = 0;	// If we have seen at least one protocol packet
 int local_packets_sniffed;
 int local_bytes_sniffed;
 int local_packets_not_needing_tunnel;
-int loopback_packets_ignored;
 int incoming_tunnel_packets;
 int incoming_tunnel_bytes;
 int ignored_captured_tunnel_packets;
@@ -76,7 +75,6 @@ zero_stats(void) {
 	local_packets_sniffed = 0;
 	local_bytes_sniffed = 0;
 	local_packets_not_needing_tunnel = 0;
-	loopback_packets_ignored = 0;
 	incoming_tunnel_packets = 0;
 	incoming_tunnel_bytes = 0;
 	ignored_captured_tunnel_packets = 0;
@@ -92,7 +90,6 @@ zero_stats(void) {
 }
 
 int reports = 0;
-int not_busy = 0;
 
 int tfd = -1;		// for the tunnel to the remote
 int cap_fd = -1;	// local capture fd
@@ -100,7 +97,6 @@ int cap_fd = -1;	// local capture fd
 int is_server;
 sa_family_t family = AF_UNSPEC;	// AF_INET or AF_INET6
 
-#define	SYSLOG_SERVICE	LOG_LOCAL1
 
 
 // bind to the client end of the tunnel to the server.
@@ -227,7 +223,6 @@ send_packet_to_remote(packet *pkt) {
 		}
 		return;
 	}
-//Log(LOG_DEBUG, ">>>TUN %s", pkt_dump_str(pkt));
 	n = sendto(tfd, pkt->data, pkt->len, MSG_EOR, 
 		remote_tunnel_sa, remote_tunnel_sa_size);
 	if (n < 0) {
@@ -235,7 +230,6 @@ send_packet_to_remote(packet *pkt) {
 			errno, strerror(errno));
 		Log(LOG_WARNING, "tfd=%d len=%d sa=%s",
 			tfd, pkt->len, sa_str(remote_tunnel_sa));
-exit(13);
 		return;
 	}
 	if (n != pkt->len)
@@ -282,12 +276,6 @@ read_tunneled_packet(int fd) {
 }
 
 
-#ifdef notsimple
-int have_tunnel_endpoints = 0;
-struct ether_addr tunnel_ether_a;
-struct ether_addr tunnel_ether_b;
-#endif
-
 int
 is_tunnel_traffic(packet *p) {
 	struct ether_header *hdr = (struct ether_header *)p->data;
@@ -296,27 +284,6 @@ is_tunnel_traffic(packet *p) {
 	struct udphdr *udph;
 	uint8_t *protohdr;
 
-#ifdef notsimple
-	if (have_tunnel_endpoints) {
-		if ((memcmp(&hdr->ether_shost, &tunnel_ether_a, ETHER_ADDR_LEN) &&
-		    memcmp(&hdr->ether_dhost, &tunnel_ether_b, ETHER_ADDR_LEN)) ||
-		    (memcmp(&hdr->ether_shost, &tunnel_ether_b, ETHER_ADDR_LEN) &&
-		    memcmp(&hdr->ether_dhost, &tunnel_ether_a, ETHER_ADDR_LEN)))
-			return 1;
-	}
-
-	// If this sniffed packet is coming from a host known to be remote,
-	// we are probably sniffing a packet we just injected locally.  Ignore it.
-
-	if (show_arps && is_arp(p))
-		Log(LOG_INFO, "<LOC arp x3: %s", pkt_dump_str(p));
-
-	if (known_remote_eaddr((struct ether_addr *)&hdr->ether_shost)) {
-		if (show_arps && is_arp(p))
-			Log(LOG_INFO, "<LOC arp !!! known remote source: %s", pkt_dump_str(p));
-		return 1;
-	}
-#endif
 	if (known_remote_eaddr((struct ether_addr *)&hdr->ether_shost)) {
 		return 1;
 	}
@@ -350,22 +317,6 @@ is_tunnel_traffic(packet *p) {
 	if (ntohs(udph->uh_sport) != RSEB_PORT || 
 	    ntohs(udph->uh_dport) != RSEB_PORT)
 		return 0;
-
-#ifdef notsimple
-	if (!have_tunnel_endpoints) {	// now we do
-		char src[ESTRLEN];
-		char dst[ESTRLEN];
-		
-		memcpy(&tunnel_ether_a, &hdr->ether_shost, ETHER_ADDR_LEN);
-		memcpy(&tunnel_ether_b, &hdr->ether_dhost, ETHER_ADDR_LEN);
-		have_tunnel_endpoints = 1;
-	
-		ether_print((struct ether_addr *)&hdr->ether_shost, src);
-		ether_print((struct ether_addr *)&hdr->ether_dhost, dst);
-		Log(LOG_DEBUG, "Have tunnel info: %s / %s  UDP %hu %hu",
-			src, dst, ntohs(udph->uh_sport), ntohs(udph->uh_dport));
-	}
-#endif
 	return 1;
 }
 
@@ -443,7 +394,6 @@ do_report(void) {
 			unconnected_local_bytes);
 	}
 
-	Log(LOG_NOTICE, "                   ignored: %d", loopback_packets_ignored);
 	Log(LOG_NOTICE, "             not forwarded: %d",
 		local_packets_not_needing_tunnel);
 	if (local_multicast)
@@ -685,7 +635,7 @@ main(int argc, char *argv[]) {
 				continue;
 			local_packets_sniffed++;
 			local_bytes_sniffed += pkt->len;
-if (debug >= 6) Log(LOG_DEBUG, "LOC %s", pkt_dump_str(pkt));
+
 			if (should_forward_local_packet(pkt)) {
 				if (!debug_no_traffic_transmit) {
 					outgoing_tunnel_packets++;
@@ -702,7 +652,6 @@ if (debug >= 6) Log(LOG_DEBUG, "LOC %s", pkt_dump_str(pkt));
 			incoming_tunnel_packets++;
 			incoming_tunnel_bytes += pkt->len;
 
-if (debug >= 6) Log(LOG_DEBUG, "TUN %s", pkt_dump_str(pkt));
 			if (IS_PROTO(pkt)) {
 				incoming_proto_packets++;
 				if (!do_proto(pkt))
@@ -732,7 +681,6 @@ if (debug >= 6) Log(LOG_DEBUG, "TUN %s", pkt_dump_str(pkt));
 			time_t t = now();
 			if (t > report_time) {
 				do_report();
-// exit(13);
 				report_time = t + REPORT_INTERVAL;
 			}
 		}

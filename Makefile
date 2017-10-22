@@ -4,9 +4,9 @@ LOCAL_RC=/usr/local/etc/rc.d
 
 REMOTE=garage-tunnel
 
-CFLAGS+=-g -static -Wall -pedantic -Wno-comment -O0
-DFLAGS+=  -lpcap
-OBJS=main.o debug.o db.o util.o  pcapio.o # bpfcapio.o  # rawcapio.o # 
+CFLAGS+=-g -static -Wall -pedantic -Wno-comment
+DFLAGS+=-lpcap
+OBJS=main.o debug.o db.o util.o pcapio.o
 
 all::	rseb
 
