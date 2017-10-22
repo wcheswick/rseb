@@ -29,23 +29,28 @@ init_capio(char *dev) {
 			dev, pcap_geterr(pcap_handle));
 		return -1;
 	}
-	if (pcap_set_timeout(pcap_handle, 1) != 0) {
+	if (pcap_set_timeout(pcap_handle, 1)) {
 		Log(LOG_ERR, "pcap_set_timeout, interface: %s",
 			pcap_geterr(pcap_handle));
 		return -1;
 	}
-	if (pcap_set_immediate_mode(pcap_handle, 1) != 0) {
+	if (pcap_set_immediate_mode(pcap_handle, 1)) {
 		Log(LOG_ERR, "pcap_set_immediate_mode: %s", 
 			pcap_geterr(pcap_handle));
 		return -1;
 	}
-
-	// ignore the outgoing traffic, which we may well have generated
-	// This does not appear to be useful on my test configuration, so
-	// I have to worry about tunnel traffic sniffed on the local ethernet
-
-	if (!pcap_setdirection(pcap_handle, PCAP_D_IN)) {
-		Log(LOG_ERR, "pcap_setdirection: pcap cannot set capture direction: %s", 
+	if (pcap_set_snaplen(pcap_handle, 2000)) {
+		Log(LOG_ERR, "pcap cannot set snap length: %s", 
+			pcap_geterr(pcap_handle));
+		return -1;
+	}
+	if (pcap_set_buffer_size(pcap_handle, 100000)) {
+		Log(LOG_ERR, "pcap_set_buffer_size: cannot set buffer size: %s", 
+			pcap_geterr(pcap_handle));
+		return -1;
+	}
+	if (pcap_set_promisc(pcap_handle, 1)) {
+		Log(LOG_ERR, "pcap_set_promisc: pcap cannot set promiscuous mode: %s", 
 			pcap_geterr(pcap_handle));
 		return -1;
 	}
@@ -71,17 +76,6 @@ init_capio(char *dev) {
 			rc, pcap_geterr(pcap_handle));
 		return -1;
 	}
-	if (!pcap_set_snaplen(pcap_handle, 2000)) {
-		Log(LOG_ERR, "pcap cannot set snap length: %s", 
-			pcap_geterr(pcap_handle));
-		return -1;
-	}
-	if (!pcap_set_promisc(pcap_handle, 1)) {
-		Log(LOG_ERR, "pcap_set_promisc: pcap cannot set promiscuous mode: %s", 
-			pcap_geterr(pcap_handle));
-		return -1;
-	}
-
 	if (pcap_setnonblock(pcap_handle, 1, pcap_err_buf) < 0) {
 		Log(LOG_ERR, "pcap_setnonblock failed: %s", pcap_geterr(pcap_handle));
 		return -1;
@@ -90,8 +84,13 @@ init_capio(char *dev) {
 		Log(LOG_ERR, "pcap_datalink: interface '%s' not supported", dev);
 		return -1;
 	}
-	if (!pcap_set_buffer_size(pcap_handle, 100000)) {
-		Log(LOG_ERR, "pcap_set_buffer_size: cannot set buffer size: %s", 
+
+	// ignore the outgoing traffic, which we may well have generated
+	// This does not appear to be useful on my test configuration, so
+	// I have to worry about tunnel traffic sniffed on the local ethernet
+
+	if (pcap_setdirection(pcap_handle, PCAP_D_IN)) {
+		Log(LOG_ERR, "pcap_setdirection: pcap cannot set capture direction: %s", 
 			pcap_geterr(pcap_handle));
 		return -1;
 	}
